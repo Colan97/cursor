@@ -684,7 +684,7 @@ def update_redirect_label(data: Dict, original_url: str) -> Dict:
 
 def main():
     st.set_page_config(layout="wide")
-    st.title("Lazy Crawler - Dynamic Frontier Mode")
+    st.title("Web Crawler")
 
     st.sidebar.header("Configuration")
     
