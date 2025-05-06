@@ -709,7 +709,7 @@ def main():
         concurrency = st.sidebar.slider("Urls/s", MIN_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_CONCURRENCY)
 
     respect_robots = st.sidebar.checkbox("Respect robots.txt", value=True)
-    mode = st.radio("Select Mode", ["Dynamic Frontier", "List", "Sitemap"], horizontal=True)
+    mode = st.radio("Select Mode", ["Spider", "List", "Sitemap"], horizontal=True)
     st.write("----")
 
     if mode == "Dynamic Frontier":
