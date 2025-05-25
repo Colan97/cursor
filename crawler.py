@@ -135,6 +135,7 @@ class URLChecker:
         self.robots_cache = {}
         self.robots_parser_cache = {}
         self.robots_rules_cache = {}
+        self.robots_cache_timestamp = {}
         self.session = None
         self.semaphore = None
         self.failed_urls = set()
@@ -145,32 +146,25 @@ class URLChecker:
         self.stop_event = asyncio.Event()
         self.last_adjustment_time = datetime.now()
         self.adjustment_interval = 10
-        self._pending_tasks = set()  # Track pending tasks
-
-    async def adjust_concurrency_if_needed(self):
-        """Adjust concurrency based on error rate if enough time has passed."""
-        now = datetime.now()
-        if (now - self.last_adjustment_time).total_seconds() >= self.adjustment_interval:
-            error_rate = calculate_error_rate(self.recent_results[-100:] if self.recent_results else [])
-            new_concurrency = adjust_concurrency(self.concurrency, error_rate)
-            
-            if new_concurrency != self.concurrency:
-                logging.info(f"Adjusting concurrency from {self.concurrency} to {new_concurrency} (error rate: {error_rate:.2%})")
-                self.concurrency = new_concurrency
-                # Create new semaphore with updated concurrency
-                self.semaphore = asyncio.Semaphore(self.concurrency)
-            
-            self.last_adjustment_time = now
+        self._pending_tasks = set()
+        self.CACHE_EXPIRY = 3600  # Cache expiry time in seconds (1 hour)
+        self.last_crawl_time = {}  # Track last crawl time per domain for crawl-delay
+        self.ssl_context = None
 
     async def setup(self):
         """Initialize the aiohttp session and semaphore."""
         try:
+            # Create SSL context with proper verification
+            self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+            self.ssl_context.check_hostname = True
+            self.ssl_context.verify_mode = ssl.CERT_REQUIRED
+
             connector = aiohttp.TCPConnector(
                 limit=9999,
                 ttl_dns_cache=300,
                 enable_cleanup_closed=True,
                 force_close=False,
-                ssl=False
+                ssl=self.ssl_context
             )
             timeout_settings = aiohttp.ClientTimeout(
                 total=None,
@@ -189,17 +183,30 @@ class URLChecker:
             logging.error(f"Error setting up URLChecker: {str(e)}")
             raise
 
-    async def close(self):
-        """Close the aiohttp session and save any remaining results."""
-        try:
-            if self.session:
-                await self.session.close()
-            # Save any remaining results
-            if self.recent_results:
-                save_results_to_file(self.recent_results, self.save_filename)
-                logging.info(f"Saved {len(self.recent_results)} results to {self.save_filename}")
-        except Exception as e:
-            logging.error(f"Error closing URLChecker: {str(e)}")
+    async def cleanup(self):
+        """Clean up resources and cancel pending tasks."""
+        self.stop_event.set()
+        
+        # Cancel all pending tasks
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        
+        self._pending_tasks.clear()
+        
+        # Close session if it exists
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+        # Save any remaining results
+        if self.recent_results:
+            save_results_to_file(self.recent_results, self.save_filename)
+            logging.info(f"Saved {len(self.recent_results)} results to {self.save_filename}")
 
     async def recrawl_failed_urls(self) -> List[Dict]:
         """
@@ -230,120 +237,154 @@ class URLChecker:
         self.failed_urls.clear()  # Clear the failed URLs set after recrawl attempts
         return results
 
-    async def check_robots(self, url: str) -> Tuple[bool, str]:
-        """
-        Check robots.txt for the given URL and user agent.
-        Returns a tuple of (allowed: bool, blocking_rule: str)
-        """
-        try:
-            parsed = urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
+    async def adjust_concurrency_if_needed(self):
+        """Adjust concurrency based on error rate if enough time has passed."""
+        now = datetime.now()
+        if (now - self.last_adjustment_time).total_seconds() >= self.adjustment_interval:
+            error_rate = calculate_error_rate(self.recent_results[-100:] if self.recent_results else [])
+            new_concurrency = adjust_concurrency(self.concurrency, error_rate)
             
-            # Extract the main user agent name
-            user_agent = self.user_agent.lower()
-            if "googlebot" in user_agent:
-                user_agent = "googlebot"
-            elif "bingbot" in user_agent:
-                user_agent = "bingbot"
-            else:
-                user_agent = re.split(r'[/\s\(]', user_agent)[0]
+            if new_concurrency != self.concurrency:
+                logging.info(f"Adjusting concurrency from {self.concurrency} to {new_concurrency} (error rate: {error_rate:.2%})")
+                self.concurrency = new_concurrency
+                # Create new semaphore with updated concurrency
+                self.semaphore = asyncio.Semaphore(self.concurrency)
+            
+            self.last_adjustment_time = now
 
-            # Check cache first
-            if base_url in self.robots_parser_cache:
-                parser = self.robots_parser_cache[base_url]
-                allowed = parser.can_fetch(user_agent, url)
-                if not allowed and base_url in self.robots_rules_cache:
-                    return False, self.robots_rules_cache[base_url].get(url, "Disallow rule found")
-                return allowed, ""
+    def _parse_user_agent(self, user_agent: str) -> str:
+        """Parse user agent string to get the bot name."""
+        user_agent = user_agent.lower()
+        
+        # Common bot patterns
+        bot_patterns = {
+            'googlebot': r'googlebot|google-bot|google\s+bot',
+            'bingbot': r'bingbot|bing-bot|bing\s+bot',
+            'yandexbot': r'yandexbot|yandex-bot|yandex\s+bot',
+            'baiduspider': r'baiduspider|baidu-spider|baidu\s+spider',
+            'duckduckbot': r'duckduckbot|duckduck-bot|duckduck\s+bot',
+            'facebookexternalhit': r'facebookexternalhit|facebook-external-hit',
+            'twitterbot': r'twitterbot|twitter-bot|twitter\s+bot',
+            'slackbot': r'slackbot|slack-bot|slack\s+bot',
+            'linkedinbot': r'linkedinbot|linkedin-bot|linkedin\s+bot',
+            'whatsapp': r'whatsapp|whats-app',
+            'telegrambot': r'telegrambot|telegram-bot|telegram\s+bot',
+            'pinterest': r'pinterest|pinterest-bot|pinterest\s+bot',
+            'applebot': r'applebot|apple-bot|apple\s+bot',
+            'petalbot': r'petalbot|petal-bot|petal\s+bot',
+            'ahrefsbot': r'ahrefsbot|ahrefs-bot|ahrefs\s+bot',
+            'semrushbot': r'semrushbot|semrush-bot|semrush\s+bot',
+            'majesticbot': r'majesticbot|majestic-bot|majestic\s+bot',
+            'mozbot': r'mozbot|moz-bot|moz\s+bot',
+            'seobot': r'seobot|seo-bot|seo\s+bot',
+            'crawler': r'crawler|crawl-bot|crawl\s+bot',
+            'spider': r'spider|spider-bot|spider\s+bot',
+            'bot': r'bot$|bot\s|bot/'
+        }
+        
+        for bot_name, pattern in bot_patterns.items():
+            if re.search(pattern, user_agent):
+                return bot_name
+        
+        # If no specific bot is found, return the first word
+        return re.split(r'[/\s\(]', user_agent)[0]
 
-            # If not in cache, fetch robots.txt
-            async with self.robots_semaphore:
-                if self.stop_event.is_set():
-                    return True, ""  # Return default if stopping
-                    
-                if base_url in self.robots_cache:
-                    content = self.robots_cache[base_url]
-                else:
+    def _is_cache_valid(self, base_url: str) -> bool:
+        """Check if the cache entry is still valid."""
+        if base_url not in self.robots_cache_timestamp:
+            return False
+        cache_age = (datetime.now() - self.robots_cache_timestamp[base_url]).total_seconds()
+        return cache_age < self.CACHE_EXPIRY
+
+    async def _apply_crawl_delay(self, base_url: str, delay: float):
+        """Apply crawl delay if needed."""
+        if delay <= 0:
+            return
+
+        now = datetime.now()
+        if base_url in self.last_crawl_time:
+            time_since_last = (now - self.last_crawl_time[base_url]).total_seconds()
+            if time_since_last < delay:
+                wait_time = delay - time_since_last
+                logging.info(f"Applying crawl delay of {wait_time:.2f} seconds for {base_url}")
+                await asyncio.sleep(wait_time)
+        
+        self.last_crawl_time[base_url] = now
+
+    def _parse_robots_content(self, content: str, user_agent: str) -> Tuple[bool, str, Dict]:
+        """Parse robots.txt content with enhanced support for modern directives."""
+        rules = {
+            'allow': {},
+            'disallow': {},
+            'crawl-delay': None,
+            'sitemap': [],
+            'host': None,
+            'clean-param': [],
+            'visit-time': None,
+            'request-rate': None
+        }
+        
+        current_user_agent = None
+        blocking_rule = ""
+        
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+                
+            # Handle user-agent directive
+            if line.lower().startswith('user-agent:'):
+                current_user_agent = line[11:].strip().lower()
+                continue
+                
+            # Only process rules for matching user agent or wildcard
+            if current_user_agent and (current_user_agent == '*' or current_user_agent == user_agent):
+                if line.lower().startswith('allow:'):
+                    pattern = line[6:].strip()
+                    if pattern:
+                        rules['allow'][pattern] = line
+                elif line.lower().startswith('disallow:'):
+                    pattern = line[9:].strip()
+                    if pattern:
+                        rules['disallow'][pattern] = line
+                elif line.lower().startswith('crawl-delay:'):
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(f"{base_url}/robots.txt", ssl=False, timeout=5) as resp:
-                                if resp.status == 200:
-                                    content = await resp.text()
-                                    self.robots_cache[base_url] = content
-                                else:
-                                    logging.info(f"No robots.txt found for {base_url} (status {resp.status})")
-                                    return True, ""
-                    except Exception as e:
-                        logging.warning(f"Could not fetch robots.txt for {base_url}: {e}")
-                        return True, ""
-
-                # Parse robots.txt and store rules
-                parser = robotparser.RobotFileParser()
-                parser.parse(content.splitlines())
-                self.robots_parser_cache[base_url] = parser
-
-                # Store rules for this domain
-                rules = {}
-                current_user_agent = None
-                allow_rules = {}
-                disallow_rules = {}
-
-                for line in content.splitlines():
-                    if self.stop_event.is_set():
-                        return True, ""  # Return default if stopping
-                        
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-
-                    if line.lower().startswith('user-agent:'):
-                        current_user_agent = line[11:].strip().lower()
-                    elif current_user_agent and (current_user_agent == '*' or current_user_agent == user_agent):
-                        if line.lower().startswith('allow:'):
-                            pattern = line[6:].strip()
-                            if pattern:
-                                allow_rules[pattern] = line
-                        elif line.lower().startswith('disallow:'):
-                            pattern = line[9:].strip()
-                            if pattern:
-                                disallow_rules[pattern] = line
-
-                # Check if URL is allowed
-                allowed = parser.can_fetch(user_agent, url)
-                if not allowed:
-                    # Find the specific rule that's blocking
-                    url_path = urlparse(url).path
-                    
-                    # First check allow rules
-                    for pattern, rule in allow_rules.items():
-                        if self._match_robots_pattern(url_path, pattern):
-                            return True, ""
-
-                    # Then check disallow rules
-                    for pattern, rule in disallow_rules.items():
-                        if self._match_robots_pattern(url_path, pattern):
-                            return False, rule
-
-                    return False, "Disallow rule found"
-
-                return True, ""
-
-        except asyncio.CancelledError:
-            logging.info(f"Robots check cancelled for {url}")
-            return True, ""
-        except Exception as e:
-            logging.error(f"Error in check_robots for {url}: {e}")
-            return True, ""
+                        rules['crawl-delay'] = float(line[11:].strip())
+                    except ValueError:
+                        pass
+                elif line.lower().startswith('sitemap:'):
+                    sitemap_url = line[8:].strip()
+                    if sitemap_url:
+                        rules['sitemap'].append(sitemap_url)
+                elif line.lower().startswith('host:'):
+                    rules['host'] = line[5:].strip()
+                elif line.lower().startswith('clean-param:'):
+                    params = line[11:].strip()
+                    if params:
+                        rules['clean-param'].append(params)
+                elif line.lower().startswith('visit-time:'):
+                    rules['visit-time'] = line[11:].strip()
+                elif line.lower().startswith('request-rate:'):
+                    rules['request-rate'] = line[12:].strip()
+        
+        return True, blocking_rule, rules
 
     def _match_robots_pattern(self, url_path: str, pattern: str) -> bool:
-        """
-        Match a URL path against a robots.txt pattern.
-        Handles wildcards and special characters correctly.
-        """
+        """Match a URL path against a robots.txt pattern."""
         if not pattern:
             return False
 
-        # Convert robots.txt pattern to regex
+        # Handle special cases
+        if pattern == '/':
+            return url_path == '/'
+        if pattern == '*':
+            return True
+
+        # Normalize the pattern and URL path
+        pattern = pattern.strip()
+        url_path = url_path.strip()
+
+        # Handle wildcards and special characters
         pattern = pattern.replace('*', '.*')
         pattern = pattern.replace('?', '.')
         pattern = pattern.replace('+', '\\+')
@@ -356,18 +397,144 @@ class URLChecker:
         pattern = pattern.replace(')', '\\)')
         pattern = pattern.replace('{', '\\{')
         pattern = pattern.replace('}', '\\}')
+        pattern = pattern.replace('|', '\\|')
+        pattern = pattern.replace('\\', '\\\\')
 
-        # Add start and end anchors if not present
-        if not pattern.startswith('^'):
+        # Handle trailing wildcards
+        if pattern.endswith('.*'):
+            pattern = pattern[:-2] + '.*$'
+        else:
+            pattern = pattern + '$'
+
+        # Handle leading wildcards
+        if pattern.startswith('.*'):
+            pattern = '^' + pattern[2:]
+        else:
             pattern = '^' + pattern
-        if not pattern.endswith('$'):
-            pattern = pattern + '.*$'
 
         try:
-            return bool(re.match(pattern, url_path))
-        except re.error:
-            logging.warning(f"Invalid regex pattern generated from robots.txt rule: {pattern}")
+            # Compile the regex pattern
+            regex = re.compile(pattern, re.IGNORECASE)
+            
+            # Test the pattern
+            match = regex.match(url_path)
+            
+            # Log the matching attempt for debugging
+            if match:
+                logging.debug(f"Pattern '{pattern}' matched URL path '{url_path}'")
+            else:
+                logging.debug(f"Pattern '{pattern}' did not match URL path '{url_path}'")
+                
+            return bool(match)
+        except re.error as e:
+            logging.warning(f"Invalid regex pattern generated from robots.txt rule: {pattern} - Error: {e}")
             return False
+        except Exception as e:
+            logging.error(f"Error matching robots.txt pattern: {e}")
+            return False
+
+    async def check_robots(self, url: str) -> Tuple[bool, str]:
+        """Check robots.txt for the given URL and user agent."""
+        try:
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            
+            # Parse user agent
+            user_agent = self._parse_user_agent(self.user_agent)
+            
+            # Check cache first
+            if base_url in self.robots_parser_cache and self._is_cache_valid(base_url):
+                parser = self.robots_parser_cache[base_url]
+                allowed = parser.can_fetch(user_agent, url)
+                if not allowed and base_url in self.robots_rules_cache:
+                    return False, self.robots_rules_cache[base_url].get(url, "Disallow rule found")
+                return allowed, ""
+
+            # If not in cache or cache expired, fetch robots.txt
+            async with self.robots_semaphore:
+                if self.stop_event.is_set():
+                    return True, ""
+
+                # Try multiple common robots.txt locations
+                robots_locations = [
+                    f"{base_url}/robots.txt",  # Standard location
+                    f"{base_url}/ROBOTS.TXT",  # Uppercase
+                    f"{base_url}/robots.txt/",  # With trailing slash
+                    f"{base_url}/robots"  # Without extension
+                ]
+                
+                content = None
+                for robots_url in robots_locations:
+                    try:
+                        if not self.session:
+                            await self.setup()
+
+                        async with self.session.get(
+                            robots_url,
+                            ssl=self.ssl_context,
+                            timeout=5,
+                            headers={"User-Agent": self.user_agent}
+                        ) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                self.robots_cache[base_url] = content
+                                self.robots_cache_timestamp[base_url] = datetime.now()
+                                logging.info(f"Found robots.txt at {robots_url}")
+                                break
+                            elif resp.status == 404:
+                                continue
+                            else:
+                                logging.warning(f"Unexpected status {resp.status} for robots.txt at {robots_url}")
+                                continue
+                    except aiohttp.ClientError as e:
+                        logging.warning(f"Network error fetching robots.txt from {robots_url}: {e}")
+                        continue
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Timeout fetching robots.txt from {robots_url}")
+                        continue
+                    except Exception as e:
+                        logging.warning(f"Error fetching robots.txt from {robots_url}: {e}")
+                        continue
+
+                if not content:
+                    logging.info(f"No robots.txt found for {base_url} in any location")
+                    return True, ""
+
+                # Parse robots.txt with enhanced parser
+                allowed, blocking_rule, rules = self._parse_robots_content(content, user_agent)
+                
+                # Store rules in cache
+                self.robots_rules_cache[base_url] = rules
+
+                # Apply crawl delay if specified
+                if rules['crawl-delay'] is not None:
+                    await self._apply_crawl_delay(base_url, float(rules['crawl-delay']))
+
+                # Check if URL is allowed
+                url_path = urlparse(url).path
+                
+                # First check allow rules
+                for pattern in rules['allow']:
+                    if self._match_robots_pattern(url_path, pattern):
+                        return True, ""
+
+                # Then check disallow rules
+                for pattern, rule in rules['disallow'].items():
+                    if self._match_robots_pattern(url_path, pattern):
+                        return False, rule
+
+                # If no specific rules match, check if there's a catch-all disallow
+                if '*' in rules['disallow']:
+                    return False, rules['disallow']['*']
+
+                return True, ""
+
+        except asyncio.CancelledError:
+            logging.info(f"Robots check cancelled for {url}")
+            return True, ""
+        except Exception as e:
+            logging.error(f"Error in check_robots for {url}: {e}")
+            return True, ""
 
     async def fetch_and_parse(self, url: str) -> Dict:
         async with self.semaphore:
@@ -597,26 +764,6 @@ class URLChecker:
     def is_stopped(self) -> bool:
         """Check if the crawl should stop."""
         return self.stop_event.is_set()
-
-    async def cleanup(self):
-        """Clean up resources and cancel pending tasks."""
-        self.stop_event.set()
-        
-        # Cancel all pending tasks
-        for task in self._pending_tasks:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        
-        self._pending_tasks.clear()
-        
-        # Close session if it exists
-        if self.session:
-            await self.session.close()
-            self.session = None
 
 async def dynamic_frontier_crawl(
     seed_url: str,
