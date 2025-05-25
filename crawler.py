@@ -41,6 +41,7 @@ import ssl
 import certifi
 from urllib3.util.retry import Retry
 from urllib3.util import ssl_
+import urllib.parse
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -275,6 +276,7 @@ class URLChecker:
                     if line.lower().startswith('disallow:'):
                         pattern = line[9:].strip()
                         if pattern:
+                            # Store the full rule line
                             rules[pattern] = line.strip()
                 self.robots_rules_cache[base_url] = rules
 
@@ -282,8 +284,13 @@ class URLChecker:
                 allowed = parser.can_fetch(user_agent, url)
                 if not allowed:
                     # Find the specific rule that's blocking
+                    url_path = urlparse(url).path
                     for pattern, rule in rules.items():
-                        if re.match(pattern.replace('*', '.*'), url):
+                        # Convert robots.txt pattern to regex
+                        regex_pattern = pattern.replace('*', '.*')
+                        if not regex_pattern.endswith('$'):
+                            regex_pattern += '.*'
+                        if re.match(regex_pattern, url_path):
                             return False, rule
                     return False, "Disallow rule found"
 
@@ -300,6 +307,7 @@ class URLChecker:
             logging.info(f"Fetching and parsing URL: {url}")
             data = {
                 "Original_URL": url,
+                "Encoded_URL": "",
                 "Content_Type": "",
                 "Initial_Status_Code": "",
                 "Initial_Status_Type": "",
@@ -320,7 +328,6 @@ class URLChecker:
                 "Indexability Reason": "",
                 "Last Modified": "",
                 "Word Count": 0,
-                "Crawl Time": 0,
                 "Timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             }
 
@@ -338,6 +345,7 @@ class URLChecker:
                             data["Initial_Status_Code"] = init_str
                             data["Initial_Status_Type"] = self.status_label(resp.status)
                             data["Final_URL"] = str(resp.url)
+                            data["Encoded_URL"] = urllib.parse.quote(str(resp.url), safe=':/?=&')
                             data["Final_Status_Code"] = str(resp.status)
                             data["Final_Status_Type"] = self.status_label(resp.status)
                             data["Last Modified"] = resp.headers.get("Last-Modified", "")
@@ -896,10 +904,10 @@ def format_and_reorder_df(df):
         'Title',
         'Meta Description',
         'Word Count',
-        'Crawl Time',
         'Last Modified',
         'HTML Lang',
-        'Timestamp'
+        'Timestamp',
+        'Encoded_URL'  # Moved to last position
     ]
     
     # Get existing columns that aren't in main_cols
@@ -941,16 +949,6 @@ def main():
     mode = st.radio("Select Mode", ["Spider", "List", "Sitemap"], horizontal=True)
     st.write("----")
 
-    # Session state for crawl control and results
-    if 'is_crawling' not in st.session_state:
-        st.session_state['is_crawling'] = False
-    if 'crawl_results' not in st.session_state:
-        st.session_state['crawl_results'] = []
-    if 'crawl_done' not in st.session_state:
-        st.session_state['crawl_done'] = False
-    if 'checker' not in st.session_state:
-        st.session_state['checker'] = None
-
     if mode == "Spider":
         st.subheader("Spider")
         seed_url = st.text_input("Seed URL", placeholder="Enter a single URL")
@@ -976,9 +974,43 @@ def main():
             include_pattern = st.text_input("Include Regex", "")
             exclude_pattern = st.text_input("Exclude Regex", "")
 
-        # Start/Stop Crawl Button
-        crawl_btn_label = "Stop Crawl" if st.session_state['is_crawling'] else "Start Crawl"
-        crawl_btn = st.button(crawl_btn_label)
+        # Create a container for the button to maintain its position
+        button_container = st.container()
+        
+        # Initialize session state for crawl control
+        if 'is_crawling' not in st.session_state:
+            st.session_state['is_crawling'] = False
+        if 'crawl_results' not in st.session_state:
+            st.session_state['crawl_results'] = []
+        if 'crawl_done' not in st.session_state:
+            st.session_state['crawl_done'] = False
+        if 'checker' not in st.session_state:
+            st.session_state['checker'] = None
+
+        # Place the button in the container
+        with button_container:
+            if st.session_state['is_crawling']:
+                if st.button("Stop Crawl", type="primary"):
+                    if st.session_state['checker']:
+                        st.session_state['checker'].stop()
+                        st.session_state['is_crawling'] = False
+                        # Save current results before stopping
+                        if st.session_state['checker'].recent_results:
+                            st.session_state['crawl_results'].extend(st.session_state['checker'].recent_results)
+                            st.session_state['crawl_done'] = True
+                        st.info("Stopping crawl after current tasks complete...")
+                        st.rerun()
+            else:
+                if st.button("Start Crawl", type="primary"):
+                    if not seed_url.strip():
+                        st.warning("No seed URL provided.")
+                        return
+                    st.session_state['is_crawling'] = True
+                    st.session_state['crawl_results'] = []
+                    st.session_state['crawl_done'] = False
+                    checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
+                    st.session_state['checker'] = checker
+                    st.rerun()
 
         progress_ph = st.empty()
         progress_bar = st.progress(0.0)
@@ -995,10 +1027,12 @@ def main():
                 f"Completed {crawled_count} of {discovered_count} ({pct:.2f}%) → {remain} Remaining"
             )
             if crawled_count % 20 == 0 or crawled_count == discovered_count:
-                df_temp = pd.DataFrame(res_list)
+                # Combine current results with any previously saved results
+                all_results = st.session_state['crawl_results'] + res_list
+                df_temp = pd.DataFrame(all_results)
                 df_temp = format_and_reorder_df(df_temp)
                 table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                # Show download button only if crawl is done
+                # Show download button if crawl is done or stopped
                 if st.session_state['crawl_done']:
                     csv_data = df_temp.to_csv(index=False)
                     csv_bytes = csv_data.encode("utf-8")
@@ -1009,45 +1043,38 @@ def main():
                         mime="text/csv"
                     )
 
-        # Handle crawl start/stop
-        if crawl_btn:
-            if not st.session_state['is_crawling']:
-                # Start crawl
-                if not seed_url.strip():
-                    st.warning("No seed URL provided.")
-                    return
-                st.session_state['is_crawling'] = True
-                st.session_state['crawl_results'] = []
-                st.session_state['crawl_done'] = False
-                checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
-                st.session_state['checker'] = checker
+        # Start the crawl if is_crawling is True
+        if st.session_state['is_crawling']:
+            try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                try:
-                    results = loop.run_until_complete(
-                        run_dynamic_crawl(
-                            seed_url=normalize_url(seed_url.strip()),
-                            checker=checker,
-                            include_pattern=include_pattern,
-                            exclude_pattern=exclude_pattern,
-                            show_partial_callback=show_partial_data
-                        )
+                results = loop.run_until_complete(
+                    run_dynamic_crawl(
+                        seed_url=normalize_url(seed_url.strip()),
+                        checker=st.session_state['checker'],
+                        include_pattern=include_pattern,
+                        exclude_pattern=exclude_pattern,
+                        show_partial_callback=show_partial_data
                     )
-                    st.session_state['crawl_results'] = results
-                    st.session_state['crawl_done'] = True
-                except Exception as e:
-                    st.error(f"Error during crawl: {str(e)}")
-                    logging.error(f"Crawl error: {e}")
-                finally:
-                    loop.close()
+                )
+                # Combine new results with any existing results
+                st.session_state['crawl_results'].extend(results)
+                st.session_state['crawl_done'] = True
                 st.session_state['is_crawling'] = False
-            else:
-                # Stop crawl
-                if st.session_state['checker']:
-                    st.session_state['checker'].stop()
-                    st.info("Stopping crawl after current tasks complete...")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error during crawl: {str(e)}")
+                logging.error(f"Crawl error: {e}")
+                # Preserve results even if there's an error
+                if st.session_state['checker'].recent_results:
+                    st.session_state['crawl_results'].extend(st.session_state['checker'].recent_results)
+                    st.session_state['crawl_done'] = True
+                st.session_state['is_crawling'] = False
+                st.rerun()
+            finally:
+                loop.close()
 
-        # After crawl, show the final intermediate table and download button
+        # Show final results if crawl is done (either completed or stopped)
         if st.session_state['crawl_done'] and st.session_state['crawl_results']:
             df_final = pd.DataFrame(st.session_state['crawl_results'])
             df_final = format_and_reorder_df(df_final)
@@ -1072,8 +1099,9 @@ def main():
 
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
-            with st.expander("Intermediate Results", expanded=True):
+            with st.expander("Results", expanded=True):
                 table_ph = st.empty()
+                download_ph = st.empty()
 
             def show_partial_data(res_list, done_count, total_count):
                 ratio = done_count / total_count if total_count else 1.0
@@ -1087,6 +1115,15 @@ def main():
                     df_temp = pd.DataFrame(res_list)
                     df_temp = format_and_reorder_df(df_temp)
                     table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                    if done_count == total_count:
+                        csv_data = df_temp.to_csv(index=False)
+                        csv_bytes = csv_data.encode("utf-8")
+                        download_ph.download_button(
+                            label="Download CSV",
+                            data=csv_bytes,
+                            file_name="crawl_results.csv",
+                            mime="text/csv"
+                        )
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             loop = asyncio.new_event_loop()
@@ -1107,23 +1144,7 @@ def main():
                 st.warning("No results from List Mode.")
                 return
 
-            df = pd.DataFrame(results)
-            st.subheader("List Mode Results")
-            st.dataframe(df, use_container_width=True)
-            
-            if df is not None and not df.empty:
-                df = format_and_reorder_df(df)
-                st.dataframe(df, use_container_width=True)
-                csv_data = df.to_csv(index=False)
-                csv_bytes = csv_data.encode("utf-8")
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_bytes,
-                    file_name="crawl_results.csv",
-                    mime="text/csv"
-                )
-
-            show_summary(df)
+            show_summary(pd.DataFrame(results))
 
     else:  # Sitemap mode
         st.subheader("Sitemap Mode")
@@ -1135,7 +1156,7 @@ def main():
                 return
 
             lines = [x.strip() for x in sitemap_text.splitlines() if x.strip()]
-            with st.expander("Discovered Sitemap URLs", expanded=True):
+            with st.expander("Discovered URLs", expanded=True):
                 table_ph = st.empty()
                 def show_partial_sitemap(all_urls):
                     df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
@@ -1151,8 +1172,9 @@ def main():
 
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
-            with st.expander("Intermediate Results", expanded=True):
+            with st.expander("Results", expanded=True):
                 table_ph = st.empty()
+                download_ph = st.empty()
 
             def show_partial_data(res_list, done_count, total_count):
                 ratio = done_count / total_count if total_count else 1.0
@@ -1166,6 +1188,15 @@ def main():
                     df_temp = pd.DataFrame(res_list)
                     df_temp = format_and_reorder_df(df_temp)
                     table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                    if done_count == total_count:
+                        csv_data = df_temp.to_csv(index=False)
+                        csv_bytes = csv_data.encode("utf-8")
+                        download_ph.download_button(
+                            label="Download CSV",
+                            data=csv_bytes,
+                            file_name="crawl_results.csv",
+                            mime="text/csv"
+                        )
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             loop = asyncio.new_event_loop()
@@ -1186,23 +1217,7 @@ def main():
                 st.warning("No results from Sitemap Mode.")
                 return
 
-            df = pd.DataFrame(results)
-            st.subheader("Sitemap Results")
-            st.dataframe(df, use_container_width=True)
-            
-            if df is not None and not df.empty:
-                df = format_and_reorder_df(df)
-                st.dataframe(df, use_container_width=True)
-                csv_data = df.to_csv(index=False)
-                csv_bytes = csv_data.encode("utf-8")
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_bytes,
-                    file_name="crawl_results.csv",
-                    mime="text/csv"
-                )
-
-            show_summary(df)
+            show_summary(pd.DataFrame(results))
 
 def show_summary(df: pd.DataFrame):
     st.subheader("Summary")
