@@ -134,7 +134,7 @@ class URLChecker:
         self.respect_robots = respect_robots
         self.robots_cache = {}
         self.robots_parser_cache = {}
-        self.robots_rules_cache = {}  # New cache for storing rules
+        self.robots_rules_cache = {}
         self.session = None
         self.semaphore = None
         self.failed_urls = set()
@@ -145,6 +145,7 @@ class URLChecker:
         self.stop_event = asyncio.Event()
         self.last_adjustment_time = datetime.now()
         self.adjustment_interval = 10
+        self._pending_tasks = set()  # Track pending tasks
 
     async def adjust_concurrency_if_needed(self):
         """Adjust concurrency based on error rate if enough time has passed."""
@@ -238,14 +239,13 @@ class URLChecker:
             parsed = urlparse(url)
             base_url = f"{parsed.scheme}://{parsed.netloc}"
             
-            # Extract the main user agent name (e.g., "Googlebot" from "Mozilla/5.0 (compatible; Googlebot/2.1)")
+            # Extract the main user agent name
             user_agent = self.user_agent.lower()
             if "googlebot" in user_agent:
                 user_agent = "googlebot"
             elif "bingbot" in user_agent:
                 user_agent = "bingbot"
             else:
-                # Extract the first word before any special characters
                 user_agent = re.split(r'[/\s\(]', user_agent)[0]
 
             # Check cache first
@@ -258,6 +258,9 @@ class URLChecker:
 
             # If not in cache, fetch robots.txt
             async with self.robots_semaphore:
+                if self.stop_event.is_set():
+                    return True, ""  # Return default if stopping
+                    
                 if base_url in self.robots_cache:
                     content = self.robots_cache[base_url]
                 else:
@@ -286,6 +289,9 @@ class URLChecker:
                 disallow_rules = {}
 
                 for line in content.splitlines():
+                    if self.stop_event.is_set():
+                        return True, ""  # Return default if stopping
+                        
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
@@ -322,6 +328,9 @@ class URLChecker:
 
                 return True, ""
 
+        except asyncio.CancelledError:
+            logging.info(f"Robots check cancelled for {url}")
+            return True, ""
         except Exception as e:
             logging.error(f"Error in check_robots for {url}: {e}")
             return True, ""
@@ -589,6 +598,26 @@ class URLChecker:
         """Check if the crawl should stop."""
         return self.stop_event.is_set()
 
+    async def cleanup(self):
+        """Clean up resources and cancel pending tasks."""
+        self.stop_event.set()
+        
+        # Cancel all pending tasks
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        
+        self._pending_tasks.clear()
+        
+        # Close session if it exists
+        if self.session:
+            await self.session.close()
+            self.session = None
+
 async def dynamic_frontier_crawl(
     seed_url: str,
     checker: URLChecker,
@@ -687,7 +716,7 @@ async def dynamic_frontier_crawl(
         logging.error(f"Error in dynamic frontier crawl: {str(e)}")
         return results
     finally:
-        await checker.close()
+        await checker.cleanup()
 
 async def discover_links(url: str, session: aiohttp.ClientSession, user_agent: str) -> List[str]:
     """
@@ -751,11 +780,11 @@ async def run_dynamic_crawl(seed_url: str, checker: URLChecker, include_pattern:
             results.extend(recrawl_results)
             logging.info(f"Recrawl completed. Added {len(recrawl_results)} more results.")
         
-        await checker.close()
+        await checker.cleanup()  # Use cleanup instead of close
         return results
     except Exception as e:
         logging.error(f"Error in dynamic crawl: {e}")
-        await checker.close()
+        await checker.cleanup()  # Ensure cleanup happens even on error
         return []
 
 async def run_list_crawl(urls: List[str], checker: URLChecker, show_partial_callback) -> List[Dict]:
@@ -768,11 +797,11 @@ async def run_list_crawl(urls: List[str], checker: URLChecker, show_partial_call
             recrawl_results = await checker.recrawl_failed_urls()
             results.extend(recrawl_results)
         
-        await checker.close()
+        await checker.cleanup()  # Use cleanup instead of close
         return results
     except Exception as e:
         logging.error(f"Error in list crawl: {e}")
-        await checker.close()
+        await checker.cleanup()  # Ensure cleanup happens even on error
         return []
 
 async def run_sitemap_crawl(urls: List[str], checker: URLChecker, show_partial_callback) -> List[Dict]:
@@ -785,11 +814,11 @@ async def run_sitemap_crawl(urls: List[str], checker: URLChecker, show_partial_c
             recrawl_results = await checker.recrawl_failed_urls()
             results.extend(recrawl_results)
         
-        await checker.close()
+        await checker.cleanup()  # Use cleanup instead of close
         return results
     except Exception as e:
         logging.error(f"Error in sitemap crawl: {e}")
-        await checker.close()
+        await checker.cleanup()  # Ensure cleanup happens even on error
         return []
 
 async def process_sitemaps(sitemap_urls: List[str], show_partial_callback=None) -> List[str]:
@@ -889,7 +918,7 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
     except Exception as e:
         logging.error(f"Error in chunk processing: {e}")
     finally:
-        await checker.close()
+        await checker.cleanup()
     
     return results
 
