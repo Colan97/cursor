@@ -134,6 +134,7 @@ class URLChecker:
         self.respect_robots = respect_robots
         self.robots_parser_cache = {}
         self.robots_cache_timestamp = {}
+        self.robots_content_cache = {}  # Cache for raw robots.txt content
         self.session = None
         self.semaphore = None
         self.failed_urls = set()
@@ -145,7 +146,7 @@ class URLChecker:
         self.last_adjustment_time = datetime.now()
         self.adjustment_interval = 10
         self._pending_tasks = set()
-        self.CACHE_EXPIRY = 3600
+        self.CACHE_EXPIRY = 3600  # 1 hour cache expiry
         self.last_crawl_time = {}
         self.ssl_context = None
         
@@ -240,7 +241,7 @@ class URLChecker:
             logging.info(f"Saved {len(self.recent_results)} results to {self.save_filename}")
 
     def _is_cache_valid(self, base_url: str) -> bool:
-        """Check if the cache entry is still valid."""
+        """Check if the robots.txt cache is still valid."""
         if base_url not in self.robots_cache_timestamp:
             return False
         cache_age = (datetime.now() - self.robots_cache_timestamp[base_url]).total_seconds()
@@ -261,102 +262,93 @@ class URLChecker:
         
         self.last_crawl_time[base_url] = now
 
+    def _parse_robots_content(self, content: str, base_url: str) -> robotparser.RobotFileParser:
+        """Enhanced robots.txt parsing with better error handling."""
+        parser = robotparser.RobotFileParser()
+        parser.set_url(base_url)
+        
+        try:
+            # Parse the content properly
+            parser.parse(content.splitlines())
+            return parser
+        except Exception as e:
+            logging.error(f"Error parsing robots.txt content: {e}")
+            return parser
+
     async def check_robots(self, url: str) -> Tuple[bool, str]:
-        """Check robots.txt for the given URL using enhanced parsing."""
+        """Enhanced robots.txt checking with better caching and error handling."""
         try:
             parsed_url_obj = urlparse(url)
             base_url = f"{parsed_url_obj.scheme}://{parsed_url_obj.netloc}"
-            robots_url = f"{base_url}/robots.txt"
-
-            # Use the full user agent string for robotparser
-            ua_to_check = self.user_agent
-
+            
             # Check cache first
             if base_url in self.robots_parser_cache and self._is_cache_valid(base_url):
                 parser = self.robots_parser_cache[base_url]
-                # Apply crawl delay if specified by the cached parser
-                crawl_delay = parser.crawl_delay(ua_to_check)
-                if crawl_delay:
-                    await self._apply_crawl_delay(base_url, float(crawl_delay))
-                
-                allowed = parser.can_fetch(ua_to_check, url)
-                return allowed, "" if allowed else f"Disallowed by {robots_url}"
+                allowed = parser.can_fetch(self.user_agent, url)
+                return allowed, "" if allowed else f"Disallowed by robots.txt rules"
 
             async with self.robots_semaphore:
                 if self.stop_event.is_set():
                     return True, ""
 
+                # Try multiple robots.txt locations
+                robots_locations = [
+                    f"{base_url}/robots.txt",
+                    f"{base_url}/ROBOTS.TXT",
+                    f"{base_url}/robots.txt/",
+                    f"{base_url}/robots"
+                ]
+
                 content = None
-                try:
-                    if not self.session:
-                        await self.setup()
+                for robots_url in robots_locations:
+                    try:
+                        if not self.session:
+                            await self.setup()
 
-                    # Try multiple robots.txt locations
-                    robots_locations = [
-                        f"{base_url}/robots.txt",
-                        f"{base_url}/ROBOTS.TXT",
-                        f"{base_url}/robots.txt/",
-                        f"{base_url}/robots"
-                    ]
+                        async with self.session.get(
+                            robots_url,
+                            ssl=self.ssl_context,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                            headers={"User-Agent": self.user_agent}
+                        ) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                self.robots_content_cache[base_url] = content
+                                self.robots_cache_timestamp[base_url] = datetime.now()
+                                logging.info(f"Fetched robots.txt from {robots_url}")
+                                break
+                            elif resp.status in [401, 403]:
+                                logging.warning(f"Access to {robots_url} forbidden (status {resp.status})")
+                                return True, ""
+                            elif resp.status in [404, 410]:
+                                continue
+                            else:
+                                logging.warning(f"Unexpected status {resp.status} for {robots_url}")
+                                continue
+                    except Exception as e:
+                        logging.warning(f"Error fetching {robots_url}: {e}")
+                        continue
 
-                    for robots_url in robots_locations:
-                        try:
-                            async with self.session.get(
-                                robots_url,
-                                ssl=self.ssl_context,
-                                timeout=aiohttp.ClientTimeout(total=10)
-                            ) as resp:
-                                if resp.status == 200:
-                                    content = await resp.text()
-                                    self.robots_cache_timestamp[base_url] = datetime.now()
-                                    logging.info(f"Fetched robots.txt from {robots_url}")
-                                    break
-                                elif resp.status in [401, 403]:
-                                    logging.warning(f"Access to {robots_url} forbidden (status {resp.status}). Assuming allow.")
-                                    return True, ""
-                                elif resp.status in [404, 410]:
-                                    continue  # Try next location
-                                else:
-                                    logging.warning(f"Unexpected status {resp.status} for {robots_url}")
-                                    continue
-                        except Exception as e:
-                            logging.warning(f"Error fetching {robots_url}: {e}")
-                            continue
-
-                    if not content:  # If no robots.txt found in any location
-                        logging.info(f"No robots.txt found for {base_url}. Assuming allow.")
-                        return True, ""
-
-                except Exception as e:
-                    logging.warning(f"Error in robots.txt check: {e}")
+                if not content:
+                    logging.info(f"No robots.txt found for {base_url}")
                     return True, ""
 
                 # Parse robots.txt content
-                parser = robotparser.RobotFileParser()
-                if content:
-                    # Enhanced parsing
-                    lines = content.splitlines()
-                    for line in lines:
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        try:
-                            parser.parse([line])
-                        except Exception as e:
-                            logging.warning(f"Error parsing robots.txt line: {line} - {e}")
-                else:
-                    parser.allow_all = True
-
+                parser = self._parse_robots_content(content, base_url)
                 self.robots_parser_cache[base_url] = parser
-                self.robots_cache_timestamp[base_url] = datetime.now()
 
-                # Apply crawl delay
-                crawl_delay = parser.crawl_delay(ua_to_check)
+                # Check if URL is allowed
+                allowed = parser.can_fetch(self.user_agent, url)
+                if not allowed:
+                    logging.info(f"URL {url} blocked by robots.txt")
+                    return False, f"Disallowed by robots.txt rules"
+
+                # Apply crawl delay if specified
+                crawl_delay = parser.crawl_delay(self.user_agent)
                 if crawl_delay:
                     await self._apply_crawl_delay(base_url, float(crawl_delay))
 
-                allowed = parser.can_fetch(ua_to_check, url)
-                return allowed, "" if allowed else f"Disallowed by {robots_url} rules"
+                return True, ""
 
         except asyncio.CancelledError:
             logging.info(f"Robots check cancelled for {url}")
