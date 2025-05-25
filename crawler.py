@@ -150,14 +150,37 @@ class URLChecker:
         self.ssl_context = None
         
         # New rate limiting attributes
-        self.domain_delays = {}  # Track delays per domain
-        self.min_delay = 1.0  # Minimum delay between requests
-        self.max_delay = 5.0  # Maximum delay between requests
+        self.domain_delays = {}
+        self.min_delay = 1.0
+        self.max_delay = 5.0
         self.current_delay = self.min_delay
         self.error_count = 0
         self.success_count = 0
-        self.last_request_time = {}  # Track last request time per domain
-        self.memory_threshold = 0.8  # 80% memory usage threshold
+        self.last_request_time = {}
+        self.memory_threshold = 0.8
+
+    async def adjust_concurrency_if_needed(self):
+        """Dynamically adjust concurrency based on error rate and performance."""
+        try:
+            now = datetime.now()
+            if (now - self.last_adjustment_time).total_seconds() < self.adjustment_interval:
+                return
+
+            total_requests = self.error_count + self.success_count
+            if total_requests > 0:
+                error_rate = self.error_count / total_requests
+                new_concurrency = adjust_concurrency(self.concurrency, error_rate)
+                
+                if new_concurrency != self.concurrency:
+                    logging.info(f"Adjusting concurrency from {self.concurrency} to {new_concurrency} (error rate: {error_rate:.2%})")
+                    self.concurrency = new_concurrency
+                    # Update semaphore
+                    if self.semaphore:
+                        self.semaphore = asyncio.Semaphore(self.concurrency)
+            
+            self.last_adjustment_time = now
+        except Exception as e:
+            logging.error(f"Error adjusting concurrency: {e}")
 
     async def setup(self):
         """Initialize the aiohttp session and semaphore."""
