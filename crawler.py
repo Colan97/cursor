@@ -285,11 +285,16 @@ class URLChecker:
             if base_url in self.robots_parser_cache and self._is_cache_valid(base_url):
                 parser = self.robots_parser_cache[base_url]
                 allowed = parser.can_fetch(self.user_agent, url)
+                logging.info(f"Using cached robots.txt for {base_url}, allowed: {allowed}")
                 return allowed, "" if allowed else f"Disallowed by robots.txt rules"
 
             async with self.robots_semaphore:
                 if self.stop_event.is_set():
                     return True, ""
+
+                # Ensure session is initialized
+                if not self.session:
+                    await self.setup()
 
                 # Try multiple robots.txt locations
                 robots_locations = [
@@ -302,12 +307,10 @@ class URLChecker:
                 content = None
                 for robots_url in robots_locations:
                     try:
-                        if not self.session:
-                            await self.setup()
-
+                        logging.info(f"Trying to fetch robots.txt from: {robots_url}")
                         async with self.session.get(
                             robots_url,
-                            ssl=self.ssl_context,
+                            ssl=False,  # Disable SSL verification for robots.txt
                             timeout=aiohttp.ClientTimeout(total=10),
                             headers={"User-Agent": self.user_agent}
                         ) as resp:
@@ -315,12 +318,13 @@ class URLChecker:
                                 content = await resp.text()
                                 self.robots_content_cache[base_url] = content
                                 self.robots_cache_timestamp[base_url] = datetime.now()
-                                logging.info(f"Fetched robots.txt from {robots_url}")
+                                logging.info(f"Successfully fetched robots.txt from {robots_url}")
                                 break
                             elif resp.status in [401, 403]:
                                 logging.warning(f"Access to {robots_url} forbidden (status {resp.status})")
                                 return True, ""
                             elif resp.status in [404, 410]:
+                                logging.info(f"robots.txt not found at {robots_url}")
                                 continue
                             else:
                                 logging.warning(f"Unexpected status {resp.status} for {robots_url}")
@@ -355,7 +359,7 @@ class URLChecker:
             return True, ""
         except Exception as e:
             logging.error(f"Error in check_robots for {url}: {e}", exc_info=True)
-            return True, ""
+            return False, f"Error checking robots.txt: {str(e)}"  # Return False on error to be safe
 
     async def _check_memory_usage(self):
         """Check if memory usage is too high and adjust accordingly."""
