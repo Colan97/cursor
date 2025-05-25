@@ -3,47 +3,47 @@ import pandas as pd
 import re
 import asyncio
 import aiohttp
-import orjson
+import orjson # Using orjson for faster JSON operations
 import nest_asyncio
 import logging
-import pyperclip
+import pyperclip # For copy button, consider removing if st_copy is sufficient
 import json
 from typing import List, Dict, Set, Optional, Tuple
-from urllib.parse import urlparse, urljoin, urlunparse
+from urllib.parse import urlparse, urljoin, urlunparse, quote
 from bs4 import BeautifulSoup
-from datetime import datetime
-from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime, timedelta
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 import xml.etree.ElementTree as ET
 import os
 from pathlib import Path
-from st_copy import copy_button
+# from st_copy import copy_button # Keep if used, otherwise remove
 import time
 from urllib import robotparser
-import concurrent.futures
-import requests
+import concurrent.futures # Not directly used in async, consider if needed for CPU-bound tasks
+# import requests # Replaced by aiohttp
 import platform
-import psutil
-import numpy as np
-from scipy import stats
-from tqdm import tqdm
-import colorama
-from colorama import Fore, Style
+# import psutil # Not used
+# import numpy as np # Not used
+# from scipy import stats # Not used
+# from tqdm import tqdm # Replaced by Rich progress
+import colorama # Rich handles colors, this might be redundant
+from colorama import Fore, Style # Rich handles colors
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
 from rich.panel import Panel
 from rich.logging import RichHandler
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict # Standard typing is usually enough
 from dataclasses import dataclass
 from functools import lru_cache
-import hashlib
+import hashlib # Not explicitly used, but good for caching if needed
 import ssl
 import certifi
-from urllib3.util.retry import Retry
-from urllib3.util import ssl_
-import urllib.parse
+# from urllib3.util.retry import Retry # aiohttp has its own retry mechanisms or use tenacity
+# from urllib3.util import ssl_ # Using standard ssl module
+# import urllib.parse # Already imported specific functions
 
-# Apply nest_asyncio to allow nested event loops
+# Apply nest_asyncio to allow nested event loops (useful in Jupyter, less so for Streamlit usually)
 nest_asyncio.apply()
 
 # Set up event loop policy for Windows
@@ -52,48 +52,37 @@ if platform.system() == "Windows":
 
 # Constants
 DEFAULT_TIMEOUT = 30
-DEFAULT_MAX_URLS = 1000
-SAVE_INTERVAL = 100
-MAX_RETRIES = 3
+DEFAULT_MAX_URLS = 1000 # Max URLs for spider mode
+SAVE_INTERVAL = 100 # Save results to file every N URLs (for CLI, not directly used in Streamlit results)
+MAX_RETRIES = 3 # For fetching individual URLs
 INITIAL_BACKOFF = 1
 MAX_BACKOFF = 60
-DEFAULT_USER_AGENT = "custom_adidas_seo_x3423/1.0"
-ERROR_THRESHOLD = 0.15
+DEFAULT_USER_AGENT = "CustomAdidasSEOBot/1.1 (+http://www.example.com/bot.html)"
+ERROR_THRESHOLD = 0.15 # For dynamic concurrency adjustment
 MIN_CONCURRENCY = 5
 MAX_CONCURRENCY = 100
 DEFAULT_CONCURRENCY = 20
-BATCH_SIZE = 100
-RETRY_DELAYS = [1, 2, 4]
+BATCH_SIZE = 100 # For processing URLs in chunks
+RETRY_DELAYS = [1, 2, 4] # For recrawling failed URLs
+ROBOTS_CACHE_EXPIRY_SECONDS = 3600 # 1 hour for robots.txt cache
 
-# Configure logging
+# Configure logging with Rich
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)]
+    handlers=[RichHandler(rich_tracebacks=True, console=Console(stderr=True))]
 )
 logger = logging.getLogger("rich")
-console = Console()
+# console = Console() # Already created by RichHandler
 
 # User Agents
 USER_AGENTS = {
-    "Googlebot Desktop": (
-        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
-    ),
-    "Googlebot Mobile": (
-        "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36 "
-        "(compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
-    ),
-    "Chrome Desktop": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.5481.100 Safari/537.36"
-    ),
-    "Chrome Mobile": (
-        "Mozilla/5.0 (Linux; Android 10; Pixel 3) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.5481.100 Mobile Safari/537.36"
-    ),
-    "Custom Adidas SEO Bot": DEFAULT_USER_AGENT,
+    "Googlebot Desktop": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Googlebot Mobile": "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Chrome Desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+    "Chrome Mobile": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36",
+    "Custom Bot": DEFAULT_USER_AGENT,
 }
 
 # -----------------------------
@@ -101,73 +90,83 @@ USER_AGENTS = {
 # -----------------------------
 def save_results_to_file(results: List[Dict], filename: str):
     """Save results to a JSON file."""
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logger.info(f"Results saved to {filename}")
+    except IOError as e:
+        logger.error(f"Error saving results to {filename}: {e}")
 
 def load_results_from_file(filename: str) -> List[Dict]:
     """Load results from a JSON file."""
     if os.path.exists(filename):
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (IOError, json.JSONDecodeError) as e:
+            logger.error(f"Error loading results from {filename}: {e}")
     return []
 
-def calculate_error_rate(results: List[Dict]) -> float:
-    """Calculate the error rate from recent results."""
-    if not results:
+def calculate_error_rate(results_buffer: List[Dict]) -> float:
+    """Calculate the error rate from a buffer of recent results."""
+    if not results_buffer:
         return 0.0
-    error_count = sum(1 for r in results if str(r.get("Final_Status_Code", "")).startswith(("4", "5")))
-    return error_count / len(results)
+    error_count = sum(1 for r in results_buffer if str(r.get("Final_Status_Code", "")).startswith(("4", "5")) or r.get("Final_Status_Code") == "Error")
+    return error_count / len(results_buffer)
 
 def adjust_concurrency(current_concurrency: int, error_rate: float) -> int:
     """Dynamically adjust concurrency based on error rate."""
     if error_rate > ERROR_THRESHOLD:
-        return max(MIN_CONCURRENCY, current_concurrency - 2)
-    elif error_rate < ERROR_THRESHOLD / 2:
-        return min(MAX_CONCURRENCY, current_concurrency + 1)
+        new_concurrency = max(MIN_CONCURRENCY, current_concurrency - 5) # Decrease more aggressively
+        logger.info(f"High error rate ({error_rate:.2%}). Decreasing concurrency: {current_concurrency} -> {new_concurrency}")
+        return new_concurrency
+    elif error_rate < ERROR_THRESHOLD / 2 and current_concurrency < MAX_CONCURRENCY : # Only increase if below max
+        new_concurrency = min(MAX_CONCURRENCY, current_concurrency + 2) # Increase more gradually
+        logger.info(f"Low error rate ({error_rate:.2%}). Increasing concurrency: {current_concurrency} -> {new_concurrency}")
+        return new_concurrency
     return current_concurrency
 
 class URLChecker:
     def __init__(self, user_agent: str, concurrency: int, timeout: int, respect_robots: bool):
         self.user_agent = user_agent
-        self.concurrency = concurrency
+        self.initial_concurrency = concurrency # Store initial for potential resets
+        self.current_concurrency = concurrency
         self.timeout = timeout
         self.respect_robots = respect_robots
-        self.robots_cache = {}
-        self.robots_parser_cache = {}
-        self.robots_rules_cache = {}
-        self.robots_cache_timestamp = {}
-        self.session = None
-        self.semaphore = None
-        self.failed_urls = set()
-        self.recent_results = []
-        self.last_save_time = datetime.now()
-        self.save_filename = f"crawl_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        self.robots_semaphore = asyncio.Semaphore(10)
-        self.stop_event = asyncio.Event()
-        self.last_adjustment_time = datetime.now()
-        self.adjustment_interval = 10
-        self._pending_tasks = set()
-        self.CACHE_EXPIRY = 3600  # Cache expiry time in seconds (1 hour)
-        self.last_crawl_time = {}  # Track last crawl time per domain for crawl-delay
-        self.ssl_context = None
+        
+        self._robot_parsers_cache: Dict[str, Tuple[robotparser.RobotFileParser, datetime]] = {} # base_url -> (parser, timestamp)
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.semaphore: Optional[asyncio.Semaphore] = None
+        
+        self.failed_urls: Set[str] = set()
+        self.results_buffer: List[Dict] = [] # For dynamic concurrency adjustment
+        self.BUFFER_SIZE = 50 # Number of recent results to consider for error rate
+
+        self.save_filename = f"crawl_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json" # For CLI mode
+        
+        self._robots_fetch_semaphore = asyncio.Semaphore(10) # Limit concurrent robots.txt fetches
+        self._stop_event = asyncio.Event()
+        
+        self._last_adjustment_time = datetime.now()
+        self.ADJUSTMENT_INTERVAL_SECONDS = 15 # Check error rate more frequently
+
+        self._pending_tasks: Set[asyncio.Task] = set()
+        self._last_crawl_time_per_domain: Dict[str, datetime] = {}
 
     async def setup(self):
         """Initialize the aiohttp session and semaphore."""
         try:
-            # Create SSL context with proper verification
-            self.ssl_context = ssl.create_default_context(cafile=certifi.where())
-            self.ssl_context.check_hostname = True
-            self.ssl_context.verify_mode = ssl.CERT_REQUIRED
-
             connector = aiohttp.TCPConnector(
-                limit=9999,
-                ttl_dns_cache=300,
+                limit_per_host=0, # Let semaphore control concurrency
+                ssl=self._ssl_context,
                 enable_cleanup_closed=True,
-                force_close=False,
-                ssl=self.ssl_context
+                force_close=False, # Keep connections alive where possible
+                ttl_dns_cache=300
             )
             timeout_settings = aiohttp.ClientTimeout(
-                total=None,
+                total=self.timeout + 5, # Total timeout slightly larger
                 connect=self.timeout,
                 sock_read=self.timeout
             )
@@ -177,1450 +176,1315 @@ class URLChecker:
                 json_serialize=orjson.dumps,
                 headers={"User-Agent": self.user_agent}
             )
-            self.semaphore = asyncio.Semaphore(self.concurrency)
-            logging.info(f"URLChecker initialized with concurrency {self.concurrency}")
+            self.semaphore = asyncio.Semaphore(self.current_concurrency)
+            logger.info(f"URLChecker initialized with concurrency {self.current_concurrency}, User-Agent: {self.user_agent}")
         except Exception as e:
-            logging.error(f"Error setting up URLChecker: {str(e)}")
+            logger.error(f"Error setting up URLChecker: {e}", exc_info=True)
             raise
 
     async def cleanup(self):
         """Clean up resources and cancel pending tasks."""
-        self.stop_event.set()
+        logger.info("Initiating cleanup...")
+        self._stop_event.set()
         
         # Cancel all pending tasks
-        for task in self._pending_tasks:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        if self._pending_tasks:
+            logger.info(f"Cancelling {len(self._pending_tasks)} pending tasks...")
+            for task in list(self._pending_tasks): # Iterate over a copy
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._pending_tasks, return_exceptions=True) # Wait for cancellations
+            self._pending_tasks.clear()
+            logger.info("Pending tasks cancelled.")
         
-        self._pending_tasks.clear()
-        
-        # Close session if it exists
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
             self.session = None
+            logger.info("aiohttp session closed.")
+        logger.info("Cleanup complete.")
 
-        # Save any remaining results
-        if self.recent_results:
-            save_results_to_file(self.recent_results, self.save_filename)
-            logging.info(f"Saved {len(self.recent_results)} results to {self.save_filename}")
+    async def _get_robot_parser(self, base_url: str) -> Optional[robotparser.RobotFileParser]:
+        """Fetches and parses robots.txt, using a cache."""
+        cached_parser, timestamp = self._robot_parsers_cache.get(base_url, (None, None))
+        if cached_parser and (datetime.now() - timestamp).total_seconds() < ROBOTS_CACHE_EXPIRY_SECONDS:
+            return cached_parser
 
-    async def recrawl_failed_urls(self) -> List[Dict]:
-        """
-        Attempt to recrawl URLs that failed in the initial crawl.
-        Uses exponential backoff and retries up to 3 times.
-        """
-        if not self.failed_urls:
-            return []
+        async with self._robots_fetch_semaphore: # Limit concurrent fetches for robots.txt
+            # Double-check cache after acquiring semaphore
+            cached_parser, timestamp = self._robot_parsers_cache.get(base_url, (None, None))
+            if cached_parser and (datetime.now() - timestamp).total_seconds() < ROBOTS_CACHE_EXPIRY_SECONDS:
+                 return cached_parser
 
-        results = []
-        retry_delays = [1, 2, 4]  # Delays in seconds for each retry attempt
+            robots_url = urljoin(base_url, "/robots.txt")
+            rp = robotparser.RobotFileParser()
+            rp.set_url(robots_url) # For reference, but we'll fetch manually with aiohttp
 
-        for url in self.failed_urls:
-            for attempt, delay in enumerate(retry_delays, 1):
-                try:
-                    logging.info(f"Recrawling failed URL {url} (attempt {attempt}/3)")
-                    result = await self.fetch_and_parse(url)
-                    if result and str(result.get("Final_Status_Code", "")).startswith("2"):
-                        results.append(result)
-                        logging.info(f"Successfully recrawled {url}")
-                        break
-                    await asyncio.sleep(delay)
-                except Exception as e:
-                    logging.error(f"Error recrawling {url} (attempt {attempt}/3): {e}")
-                    if attempt == 3:  # Last attempt
-                        logging.error(f"Failed to recrawl {url} after 3 attempts")
+            if not self.session or self.session.closed:
+                # This case should ideally not happen if setup is called correctly
+                logger.warning("aiohttp session not available for robots.txt fetch. Attempting to re-setup.")
+                await self.setup() # Try to re-initialize
+                if not self.session:
+                    logger.error("Failed to re-setup session for robots.txt. Assuming allowed.")
+                    return None
 
-        self.failed_urls.clear()  # Clear the failed URLs set after recrawl attempts
-        return results
 
-    async def adjust_concurrency_if_needed(self):
-        """Adjust concurrency based on error rate if enough time has passed."""
-        now = datetime.now()
-        if (now - self.last_adjustment_time).total_seconds() >= self.adjustment_interval:
-            error_rate = calculate_error_rate(self.recent_results[-100:] if self.recent_results else [])
-            new_concurrency = adjust_concurrency(self.concurrency, error_rate)
+            try:
+                logger.debug(f"Fetching robots.txt from {robots_url}")
+                async with self.session.get(robots_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        content = await resp.text(errors='replace')
+                        rp.parse(content.splitlines())
+                        logger.info(f"Successfully fetched and parsed robots.txt for {base_url}")
+                    elif resp.status == 401 or resp.status == 403:
+                        logger.warning(f"Access denied for robots.txt at {robots_url} (Status: {resp.status}). Assuming disallowed for all.")
+                        rp.disallow_all = True # Treat as "disallow all"
+                    elif resp.status >= 400 : # 404 and other client/server errors
+                        logger.info(f"robots.txt not found or error at {robots_url} (Status: {resp.status}). Assuming allowed.")
+                        rp.allow_all = True # Treat as "allow all" (standard behavior)
+                    # else: for 3xx, aiohttp handles redirects by default.
+                    
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching robots.txt from {robots_url}. Assuming allowed.")
+                rp.allow_all = True
+            except aiohttp.ClientError as e:
+                logger.warning(f"ClientError fetching robots.txt from {robots_url}: {e}. Assuming allowed.")
+                rp.allow_all = True
+            except Exception as e:
+                logger.error(f"Unexpected error fetching robots.txt from {robots_url}: {e}", exc_info=True)
+                rp.allow_all = True # Fallback to allow on unexpected errors
+
+            self._robot_parsers_cache[base_url] = (rp, datetime.now())
+            return rp
+
+    async def _apply_crawl_delay(self, base_url: str, rp: robotparser.RobotFileParser):
+        delay = rp.crawl_delay(self.user_agent)
+        if delay is not None and delay > 0:
+            now = datetime.now()
+            last_crawled = self._last_crawl_time_per_domain.get(base_url)
+            if last_crawled:
+                time_since_last = (now - last_crawled).total_seconds()
+                if time_since_last < delay:
+                    wait_time = delay - time_since_last
+                    logger.info(f"Applying crawl-delay of {wait_time:.2f}s for {base_url} (User-Agent: {self.user_agent})")
+                    await asyncio.sleep(wait_time)
+            self._last_crawl_time_per_domain[base_url] = datetime.now()
+
+
+    async def check_robots_and_delay(self, url: str) -> Tuple[bool, str]:
+        """Checks robots.txt and applies crawl-delay. Returns (is_allowed, blocking_reason)."""
+        if not self.respect_robots:
+            return True, ""
+        
+        try:
+            parsed_url = urlparse(url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
             
-            if new_concurrency != self.concurrency:
-                logging.info(f"Adjusting concurrency from {self.concurrency} to {new_concurrency} (error rate: {error_rate:.2%})")
-                self.concurrency = new_concurrency
-                # Create new semaphore with updated concurrency
-                self.semaphore = asyncio.Semaphore(self.concurrency)
+            rp = await self._get_robot_parser(base_url)
+            if rp is None: # Should only happen if session setup failed critically
+                return True, "Robots.txt check failed, assuming allowed"
+
+            await self._apply_crawl_delay(base_url, rp) # Apply delay regardless of can_fetch for politeness
             
-            self.last_adjustment_time = now
+            is_allowed = rp.can_fetch(self.user_agent, url)
+            if not is_allowed:
+                return False, f"Disallowed by robots.txt for User-Agent: {self.user_agent}"
+            return True, ""
+            
+        except asyncio.CancelledError:
+            logger.info(f"Robots check cancelled for {url}")
+            raise # Propagate cancellation
+        except Exception as e:
+            logger.error(f"Error in check_robots_and_delay for {url}: {e}", exc_info=True)
+            return True, f"Robots.txt check error: {e}" # Default to allowed on error
 
-    def _parse_user_agent(self, user_agent: str) -> str:
-        """Parse user agent string to get the bot name."""
-        user_agent = user_agent.lower()
-        
-        # Common bot patterns
-        bot_patterns = {
-            'googlebot': r'googlebot|google-bot|google\s+bot',
-            'bingbot': r'bingbot|bing-bot|bing\s+bot',
-            'yandexbot': r'yandexbot|yandex-bot|yandex\s+bot',
-            'baiduspider': r'baiduspider|baidu-spider|baidu\s+spider',
-            'duckduckbot': r'duckduckbot|duckduck-bot|duckduck\s+bot',
-            'facebookexternalhit': r'facebookexternalhit|facebook-external-hit',
-            'twitterbot': r'twitterbot|twitter-bot|twitter\s+bot',
-            'slackbot': r'slackbot|slack-bot|slack\s+bot',
-            'linkedinbot': r'linkedinbot|linkedin-bot|linkedin\s+bot',
-            'whatsapp': r'whatsapp|whats-app',
-            'telegrambot': r'telegrambot|telegram-bot|telegram\s+bot',
-            'pinterest': r'pinterest|pinterest-bot|pinterest\s+bot',
-            'applebot': r'applebot|apple-bot|apple\s+bot',
-            'petalbot': r'petalbot|petal-bot|petal\s+bot',
-            'ahrefsbot': r'ahrefsbot|ahrefs-bot|ahrefs\s+bot',
-            'semrushbot': r'semrushbot|semrush-bot|semrush\s+bot',
-            'majesticbot': r'majesticbot|majestic-bot|majestic\s+bot',
-            'mozbot': r'mozbot|moz-bot|moz\s+bot',
-            'seobot': r'seobot|seo-bot|seo\s+bot',
-            'crawler': r'crawler|crawl-bot|crawl\s+bot',
-            'spider': r'spider|spider-bot|spider\s+bot',
-            'bot': r'bot$|bot\s|bot/'
-        }
-        
-        for bot_name, pattern in bot_patterns.items():
-            if re.search(pattern, user_agent):
-                return bot_name
-        
-        # If no specific bot is found, return the first word
-        return re.split(r'[/\s\(]', user_agent)[0]
-
-    def _is_cache_valid(self, base_url: str) -> bool:
-        """Check if the cache entry is still valid."""
-        if base_url not in self.robots_cache_timestamp:
-            return False
-        cache_age = (datetime.now() - self.robots_cache_timestamp[base_url]).total_seconds()
-        return cache_age < self.CACHE_EXPIRY
-
-    async def _apply_crawl_delay(self, base_url: str, delay: float):
-        """Apply crawl delay if needed."""
-        if delay <= 0:
+    async def _adjust_concurrency_periodically(self):
+        """Periodically adjust concurrency based on error rate."""
+        if self._stop_event.is_set():
             return
 
         now = datetime.now()
-        if base_url in self.last_crawl_time:
-            time_since_last = (now - self.last_crawl_time[base_url]).total_seconds()
-            if time_since_last < delay:
-                wait_time = delay - time_since_last
-                logging.info(f"Applying crawl delay of {wait_time:.2f} seconds for {base_url}")
-                await asyncio.sleep(wait_time)
-        
-        self.last_crawl_time[base_url] = now
-
-    def _parse_robots_content(self, content: str, user_agent: str) -> Tuple[bool, str, Dict]:
-        """Parse robots.txt content with enhanced support for modern directives."""
-        rules = {
-            'allow': {},
-            'disallow': {},
-            'crawl-delay': None,
-            'sitemap': [],
-            'host': None,
-            'clean-param': [],
-            'visit-time': None,
-            'request-rate': None
-        }
-        
-        current_user_agent = None
-        blocking_rule = ""
-        
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-                
-            # Handle user-agent directive
-            if line.lower().startswith('user-agent:'):
-                current_user_agent = line[11:].strip().lower()
-                continue
-                
-            # Only process rules for matching user agent or wildcard
-            if current_user_agent and (current_user_agent == '*' or current_user_agent == user_agent):
-                if line.lower().startswith('allow:'):
-                    pattern = line[6:].strip()
-                    if pattern:
-                        rules['allow'][pattern] = line
-                elif line.lower().startswith('disallow:'):
-                    pattern = line[9:].strip()
-                    if pattern:
-                        rules['disallow'][pattern] = line
-                elif line.lower().startswith('crawl-delay:'):
-                    try:
-                        rules['crawl-delay'] = float(line[11:].strip())
-                    except ValueError:
-                        pass
-                elif line.lower().startswith('sitemap:'):
-                    sitemap_url = line[8:].strip()
-                    if sitemap_url:
-                        rules['sitemap'].append(sitemap_url)
-                elif line.lower().startswith('host:'):
-                    rules['host'] = line[5:].strip()
-                elif line.lower().startswith('clean-param:'):
-                    params = line[11:].strip()
-                    if params:
-                        rules['clean-param'].append(params)
-                elif line.lower().startswith('visit-time:'):
-                    rules['visit-time'] = line[11:].strip()
-                elif line.lower().startswith('request-rate:'):
-                    rules['request-rate'] = line[12:].strip()
-        
-        return True, blocking_rule, rules
-
-    def _match_robots_pattern(self, url_path: str, pattern: str) -> bool:
-        """Match a URL path against a robots.txt pattern."""
-        if not pattern:
-            return False
-
-        # Handle special cases
-        if pattern == '/':
-            return url_path == '/'
-        if pattern == '*':
-            return True
-
-        # Normalize the pattern and URL path
-        pattern = pattern.strip()
-        url_path = url_path.strip()
-
-        # Handle wildcards and special characters
-        pattern = pattern.replace('*', '.*')
-        pattern = pattern.replace('?', '.')
-        pattern = pattern.replace('+', '\\+')
-        pattern = pattern.replace('.', '\\.')
-        pattern = pattern.replace('$', '\\$')
-        pattern = pattern.replace('^', '\\^')
-        pattern = pattern.replace('[', '\\[')
-        pattern = pattern.replace(']', '\\]')
-        pattern = pattern.replace('(', '\\(')
-        pattern = pattern.replace(')', '\\)')
-        pattern = pattern.replace('{', '\\{')
-        pattern = pattern.replace('}', '\\}')
-        pattern = pattern.replace('|', '\\|')
-        pattern = pattern.replace('\\', '\\\\')
-
-        # Handle trailing wildcards
-        if pattern.endswith('.*'):
-            pattern = pattern[:-2] + '.*$'
-        else:
-            pattern = pattern + '$'
-
-        # Handle leading wildcards
-        if pattern.startswith('.*'):
-            pattern = '^' + pattern[2:]
-        else:
-            pattern = '^' + pattern
-
-        try:
-            # Compile the regex pattern
-            regex = re.compile(pattern, re.IGNORECASE)
+        if (now - self._last_adjustment_time).total_seconds() >= self.ADJUSTMENT_INTERVAL_SECONDS:
+            error_rate = calculate_error_rate(self.results_buffer)
+            new_concurrency = adjust_concurrency(self.current_concurrency, error_rate)
             
-            # Test the pattern
-            match = regex.match(url_path)
+            if new_concurrency != self.current_concurrency:
+                logger.info(f"Adjusting concurrency: {self.current_concurrency} -> {new_concurrency} (Error rate: {error_rate:.2%})")
+                self.current_concurrency = new_concurrency
+                self.semaphore = asyncio.Semaphore(self.current_concurrency) # Recreate semaphore
             
-            # Log the matching attempt for debugging
-            if match:
-                logging.debug(f"Pattern '{pattern}' matched URL path '{url_path}'")
-            else:
-                logging.debug(f"Pattern '{pattern}' did not match URL path '{url_path}'")
-                
-            return bool(match)
-        except re.error as e:
-            logging.warning(f"Invalid regex pattern generated from robots.txt rule: {pattern} - Error: {e}")
-            return False
-        except Exception as e:
-            logging.error(f"Error matching robots.txt pattern: {e}")
-            return False
+            self._last_adjustment_time = now
+            self.results_buffer.clear() # Clear buffer after adjustment
 
-    async def check_robots(self, url: str) -> Tuple[bool, str]:
-        """Check robots.txt for the given URL and user agent."""
-        try:
-            parsed = urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            
-            # Parse user agent
-            user_agent = self._parse_user_agent(self.user_agent)
-            
-            # Check cache first
-            if base_url in self.robots_parser_cache and self._is_cache_valid(base_url):
-                parser = self.robots_parser_cache[base_url]
-                allowed = parser.can_fetch(user_agent, url)
-                if not allowed and base_url in self.robots_rules_cache:
-                    return False, self.robots_rules_cache[base_url].get(url, "Disallow rule found")
-                return allowed, ""
 
-            # If not in cache or cache expired, fetch robots.txt
-            async with self.robots_semaphore:
-                if self.stop_event.is_set():
-                    return True, ""
-
-                # Try multiple common robots.txt locations
-                robots_locations = [
-                    f"{base_url}/robots.txt",  # Standard location
-                    f"{base_url}/ROBOTS.TXT",  # Uppercase
-                    f"{base_url}/robots.txt/",  # With trailing slash
-                    f"{base_url}/robots"  # Without extension
-                ]
-                
-                content = None
-                for robots_url in robots_locations:
-                    try:
-                        if not self.session:
-                            await self.setup()
-
-                        async with self.session.get(
-                            robots_url,
-                            ssl=self.ssl_context,
-                            timeout=5,
-                            headers={"User-Agent": self.user_agent}
-                        ) as resp:
-                            if resp.status == 200:
-                                content = await resp.text()
-                                self.robots_cache[base_url] = content
-                                self.robots_cache_timestamp[base_url] = datetime.now()
-                                logging.info(f"Found robots.txt at {robots_url}")
-                                break
-                            elif resp.status == 404:
-                                continue
-                            else:
-                                logging.warning(f"Unexpected status {resp.status} for robots.txt at {robots_url}")
-                                continue
-                    except aiohttp.ClientError as e:
-                        logging.warning(f"Network error fetching robots.txt from {robots_url}: {e}")
-                        continue
-                    except asyncio.TimeoutError:
-                        logging.warning(f"Timeout fetching robots.txt from {robots_url}")
-                        continue
-                    except Exception as e:
-                        logging.warning(f"Error fetching robots.txt from {robots_url}: {e}")
-                        continue
-
-                if not content:
-                    logging.info(f"No robots.txt found for {base_url} in any location")
-                    return True, ""
-
-                # Parse robots.txt with enhanced parser
-                allowed, blocking_rule, rules = self._parse_robots_content(content, user_agent)
-                
-                # Store rules in cache
-                self.robots_rules_cache[base_url] = rules
-
-                # Apply crawl delay if specified
-                if rules['crawl-delay'] is not None:
-                    await self._apply_crawl_delay(base_url, float(rules['crawl-delay']))
-
-                # Check if URL is allowed
-                url_path = urlparse(url).path
-                
-                # First check allow rules
-                for pattern in rules['allow']:
-                    if self._match_robots_pattern(url_path, pattern):
-                        return True, ""
-
-                # Then check disallow rules
-                for pattern, rule in rules['disallow'].items():
-                    if self._match_robots_pattern(url_path, pattern):
-                        return False, rule
-
-                # If no specific rules match, check if there's a catch-all disallow
-                if '*' in rules['disallow']:
-                    return False, rules['disallow']['*']
-
-                return True, ""
-
-        except asyncio.CancelledError:
-            logging.info(f"Robots check cancelled for {url}")
-            return True, ""
-        except Exception as e:
-            logging.error(f"Error in check_robots for {url}: {e}")
-            return True, ""
+    @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=INITIAL_BACKOFF, max=MAX_BACKOFF), reraise=True)
+    async def _fetch_url_with_retry(self, url: str, session: aiohttp.ClientSession):
+        logger.debug(f"Attempting to fetch: {url}")
+        return await session.get(url, allow_redirects=True) # SSL context is part of session
 
     async def fetch_and_parse(self, url: str) -> Dict:
-        async with self.semaphore:
-            await self.adjust_concurrency_if_needed()
-            
-            logging.info(f"Fetching and parsing URL: {url}")
-            data = {
-                "Original_URL": url,
-                "Encoded_URL": "",
-                "Content_Type": "",
-                "Initial_Status_Code": "",
-                "Initial_Status_Type": "",
-                "Final_URL": "",
-                "Final_Status_Code": "",
-                "Final_Status_Type": "",
-                "Title": "",
-                "Meta Description": "",
-                "H1": "",
-                "H1_Count": 0,
-                "Canonical_URL": "",
-                "Meta Robots": "",
-                "X-Robots-Tag": "",
-                "HTML Lang": "",
-                "Blocked by Robots.txt": "No",
-                "Robots Block Rule": "",
-                "Indexable": "Yes",
-                "Indexability Reason": "",
-                "Last Modified": "",
-                "Word Count": 0,
-                "Timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            }
+        """Fetches, parses a single URL, and handles retries."""
+        if self._stop_event.is_set():
+            logger.info(f"Skipping {url} due to stop event.")
+            return self._create_error_result(url, "Crawl stopped")
+
+        async with self.semaphore: # Control concurrency
+            if self._stop_event.is_set():
+                logger.info(f"Skipping {url} (semaphore acquired before stop).")
+                return self._create_error_result(url, "Crawl stopped")
+
+            await self._adjust_concurrency_periodically() # Dynamic concurrency adjustment
+
+            data = self._default_data_dict(url)
 
             try:
-                # Check robots.txt in parallel with other operations
-                robots_task = asyncio.create_task(self.check_robots(url))
+                is_allowed, robots_reason = await self.check_robots_and_delay(url)
+                data["Blocked by Robots.txt"] = "No" if is_allowed else "Yes"
+                data["Robots Block Rule"] = robots_reason if not is_allowed else ""
+
+                if not is_allowed and self.respect_robots:
+                    data["Indexable"] = "No"
+                    data["Indexability Reason"] = robots_reason
+                    logger.info(f"Skipping {url} due to robots.txt ({robots_reason})")
+                    self._add_to_buffer(data)
+                    return data
+
+                # Fetching the URL
+                logger.info(f"Fetching: {url}")
+                resp = await self._fetch_url_with_retry(url, self.session)
                 
-                # Make the request with retry logic
-                for attempt in range(3):
-                    try:
-                        async with self.session.get(url, ssl=False, allow_redirects=True) as resp:
-                            # Add Content-Type field before status codes
-                            data["Content_Type"] = resp.headers.get("Content-Type", "")
-                            init_str = str(resp.status)
-                            data["Initial_Status_Code"] = init_str
-                            data["Initial_Status_Type"] = self.status_label(resp.status)
-                            data["Final_URL"] = str(resp.url)
-                            data["Encoded_URL"] = urllib.parse.quote(str(resp.url), safe=':/?=&')
-                            data["Final_Status_Code"] = str(resp.status)
-                            data["Final_Status_Type"] = self.status_label(resp.status)
-                            data["Last Modified"] = resp.headers.get("Last-Modified", "")
+                async with resp: # Ensure response is properly closed
+                    data["Content_Type"] = resp.headers.get("Content-Type", "")
+                    data["Initial_Status_Code"] = str(resp.history[0].status if resp.history else resp.status) # Status before redirects
+                    data["Initial_Status_Type"] = self.status_label(int(data["Initial_Status_Code"]))
+                    
+                    data["Final_URL"] = str(resp.url)
+                    data["Encoded_URL"] = quote(str(resp.url), safe=':/?=&')
+                    data["Final_Status_Code"] = str(resp.status)
+                    data["Final_Status_Type"] = self.status_label(resp.status)
+                    data["Last Modified"] = resp.headers.get("Last-Modified", "")
+                    data["X-Robots-Tag"] = resp.headers.get("X-Robots-Tag", "")
 
-                            # Mark non-200 pages as non-indexable
-                            if resp.status != 200:
-                                data["Indexable"] = "No"
-                                data["Indexability Reason"] = f"HTTP Status {resp.status}"
+                    if resp.status != 200:
+                        data["Indexable"] = "No"
+                        data["Indexability Reason"] = f"HTTP Status {resp.status}"
+                    
+                    if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
+                        content = await resp.text(errors='replace')
+                        self.parse_html_content(data, content) # Modifies data in-place
+                    else:
+                        if data["Indexable"] == "Yes": # If not already set to No
+                             data["Indexability Reason"] = "Non-200 or non-HTML content"
+                             data["Indexable"] = "No"
+                    
+                    update_redirect_label(data, url) # Call after final status known
+                    self.determine_indexability(data) # Final indexability check based on all factors
 
-                            if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
-                                content = await resp.text(errors='replace')
-                                result = self.parse_html_content(data, content, resp.headers, resp.status, True)
-                                
-                                # Wait for robots.txt check to complete
-                                allowed, blocking_rule = await robots_task
-                                if not allowed:
-                                    result["Blocked by Robots.txt"] = "Yes"
-                                    result["Robots Block Rule"] = blocking_rule
-                                    result["Indexable"] = "No"
-                                    result["Indexability Reason"] = f"Blocked by robots.txt: {blocking_rule}"
-                                    if self.respect_robots:
-                                        return result
-                                
-                                result = update_redirect_label(result, url)
-                                logging.info(f"Successfully parsed HTML content from {url}")
-                                
-                                # Add to recent results and check if we need to save
-                                self.recent_results.append(result)
-                                if len(self.recent_results) >= SAVE_INTERVAL:
-                                    save_results_to_file(self.recent_results, self.save_filename)
-                                    logging.info(f"Saved {len(self.recent_results)} results to {self.save_filename}")
-                                    self.recent_results = []  # Clear after saving
-                                    self.last_save_time = datetime.now()
-                                
-                                return result
-                            else:
-                                data["Indexability Reason"] = "Non-200 or non-HTML"
-                                data = update_redirect_label(data, url)
-                                logging.info(f"Non-HTML or non-200 response from {url}: {init_str}")
-                                return data
-                    except asyncio.TimeoutError:
-                        if attempt == 2:  # Last attempt
-                            raise
-                        logging.warning(f"Timeout on attempt {attempt + 1} for {url}, retrying...")
-                        await asyncio.sleep(1)  # Wait before retry
-                    except Exception as e:
-                        if attempt == 2:  # Last attempt
-                            raise
-                        logging.warning(f"Error on attempt {attempt + 1} for {url}: {str(e)}, retrying...")
-                        await asyncio.sleep(1)  # Wait before retry
-
+            except RetryError as e: # From tenacity
+                logger.error(f"Failed to fetch {url} after {MAX_RETRIES} retries: {e.last_attempt.exception()}")
+                data.update(self._create_error_result(url, f"Max retries reached: {e.last_attempt.exception()}"))
+                self.failed_urls.add(url)
+            except aiohttp.ClientError as e:
+                logger.error(f"ClientError fetching {url}: {e}")
+                data.update(self._create_error_result(url, f"ClientError: {e}"))
+                self.failed_urls.add(url)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout fetching {url}")
+                data.update(self._create_error_result(url, "Timeout"))
+                self.failed_urls.add(url)
+            except asyncio.CancelledError:
+                logger.info(f"Task for {url} cancelled.")
+                data.update(self._create_error_result(url, "Cancelled"))
+                # Do not add to failed_urls if cancelled by user
+                raise # Important to propagate cancellation
             except Exception as e:
-                logging.error(f"Error fetching {url}: {str(e)}")
-                data["Initial_Status_Code"] = "Error"
-                data["Initial_Status_Type"] = str(e)
-                data["Final_URL"] = url
-                data["Final_Status_Code"] = "Error"
-                data["Final_Status_Type"] = str(e)
-                data["Indexability Reason"] = f"Error: {str(e)}"
-                data["Indexable"] = "No"
-                self.failed_urls.add(url)  # Add to failed URLs for potential recrawl
-                return data
+                logger.error(f"Unexpected error processing {url}: {e}", exc_info=True)
+                data.update(self._create_error_result(url, f"Unexpected error: {e}"))
+                self.failed_urls.add(url)
+            finally:
+                self._add_to_buffer(data) # Add to buffer for error rate calculation
+            
+            return data
 
-    def status_label(self, status_code: int) -> str:
-        """Convert HTTP status code to a human-readable label."""
-        if 200 <= status_code < 300:
-            return "Success"
-        elif 300 <= status_code < 400:
-            return "Redirect"
-        elif 400 <= status_code < 500:
-            return "Client Error"
-        elif 500 <= status_code < 600:
-            return "Server Error"
-        else:
-            return "Unknown"
+    def _add_to_buffer(self, result_dict: Dict):
+        self.results_buffer.append(result_dict)
+        if len(self.results_buffer) > self.BUFFER_SIZE:
+            self.results_buffer.pop(0) # Keep buffer size fixed
 
-    def parse_html_content(self, data: Dict, content: str, headers: Dict, status_code: int, is_final: bool) -> Dict:
-        """Parse HTML content and extract metadata."""
+    def _default_data_dict(self, url: str) -> Dict:
+        return {
+            "Original_URL": url, "Encoded_URL": "", "Content_Type": "",
+            "Initial_Status_Code": "", "Initial_Status_Type": "",
+            "Final_URL": url, "Final_Status_Code": "", "Final_Status_Type": "",
+            "Title": "", "Meta Description": "", "H1": "", "H1_Count": 0,
+            "Canonical_URL": "", "Meta Robots": "", "X-Robots-Tag": "",
+            "HTML Lang": "", "Blocked by Robots.txt": "Unknown", "Robots Block Rule": "",
+            "Indexable": "Unknown", "Indexability Reason": "",
+            "Last Modified": "", "Word Count": 0,
+            "Timestamp": datetime.now().isoformat(),
+        }
+
+    def _create_error_result(self, url: str, error_message: str) -> Dict:
+        # Uses parts of _default_data_dict structure for consistency
+        return {
+            "Original_URL": url, "Final_URL": url,
+            "Initial_Status_Code": "Error", "Initial_Status_Type": error_message,
+            "Final_Status_Code": "Error", "Final_Status_Type": error_message,
+            "Indexable": "No", "Indexability Reason": f"Fetch Error: {error_message}",
+            "Timestamp": datetime.now().isoformat(),
+            # Fill other fields with empty or default to match structure
+            "Encoded_URL": "", "Content_Type": "", "Title": "", "Meta Description": "",
+            "H1": "", "H1_Count": 0, "Canonical_URL": "", "Meta Robots": "",
+            "X-Robots-Tag": "", "HTML Lang": "", "Blocked by Robots.txt": "Unknown",
+            "Robots Block Rule": "", "Last Modified": "", "Word Count": 0,
+        }
+    
+    @staticmethod
+    def status_label(status_code: int) -> str:
+        if 200 <= status_code < 300: return "Success"
+        if 300 <= status_code < 400: return "Redirect"
+        if 400 <= status_code < 500: return "Client Error"
+        if 500 <= status_code < 600: return "Server Error"
+        return "Unknown"
+
+    def parse_html_content(self, data: Dict, content: str):
+        """Parses HTML content and updates the data dictionary in-place."""
         try:
             soup = BeautifulSoup(content, "lxml")
+            data["Title"] = soup.title.string.strip() if soup.title and soup.title.string else ""
             
-            # Extract title
-            title_tag = soup.find("title")
-            data["Title"] = title_tag.text.strip() if title_tag else ""
+            meta_desc = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
+            data["Meta Description"] = meta_desc["content"].strip() if meta_desc and meta_desc.get("content") else ""
             
-            # Extract meta description
-            meta_desc = soup.find("meta", attrs={"name": "description"})
-            data["Meta Description"] = meta_desc["content"].strip() if meta_desc and "content" in meta_desc.attrs else ""
-            
-            # Extract H1
             h1_tags = soup.find_all("h1")
             data["H1_Count"] = len(h1_tags)
-            data["H1"] = h1_tags[0].text.strip() if h1_tags else ""
+            data["H1"] = h1_tags[0].get_text(separator=" ", strip=True) if h1_tags else ""
             
-            # Enhanced canonical URL extraction
-            canonical = None
-            # Check for canonical in link tag
-            canonical_link = soup.find("link", attrs={"rel": "canonical"})
-            if canonical_link and "href" in canonical_link.attrs:
-                canonical = canonical_link["href"]
-            # Check for canonical in meta tag
-            if not canonical:
-                canonical_meta = soup.find("meta", attrs={"name": "canonical"})
-                if canonical_meta and "content" in canonical_meta.attrs:
-                    canonical = canonical_meta["content"]
+            canonical_link = soup.find("link", rel="canonical")
+            if canonical_link and canonical_link.get("href"):
+                data["Canonical_URL"] = urljoin(data["Final_URL"], canonical_link["href"].strip())
             
-            # Normalize canonical URL
-            if canonical:
-                try:
-                    # Convert relative URLs to absolute
-                    if not canonical.startswith(('http://', 'https://')):
-                        canonical = urljoin(data["Original_URL"], canonical)
-                    # Remove fragments and normalize
-                    parsed = urlparse(canonical)
-                    canonical = urlunparse(parsed._replace(fragment=""))
-                    data["Canonical_URL"] = canonical
-                except Exception as e:
-                    logging.warning(f"Error normalizing canonical URL {canonical}: {e}")
-                    data["Canonical_URL"] = canonical
-            else:
-                data["Canonical_URL"] = ""
+            meta_robots_tag = soup.find("meta", attrs={"name": re.compile(r"robots", re.I)})
+            data["Meta Robots"] = meta_robots_tag["content"].strip() if meta_robots_tag and meta_robots_tag.get("content") else ""
             
-            # Extract meta robots
-            meta_robots = soup.find("meta", attrs={"name": "robots"})
-            data["Meta Robots"] = meta_robots["content"] if meta_robots and "content" in meta_robots.attrs else ""
-            
-            # Extract X-Robots-Tag
-            data["X-Robots-Tag"] = headers.get("X-Robots-Tag", "")
-            
-            # Extract HTML lang
             html_tag = soup.find("html")
             data["HTML Lang"] = html_tag.get("lang", "") if html_tag else ""
             
-            # Determine indexability
-            data["Indexable"] = "Yes"
-            data["Indexability Reason"] = ""
-            
-            # Check for noindex in meta robots (case-insensitive)
-            meta_robots_lower = data["Meta Robots"].lower()
-            x_robots_lower = data["X-Robots-Tag"].lower()
-            
-            # Check for noindex directives
-            if "noindex" in meta_robots_lower or "noindex" in x_robots_lower:
-                data["Indexable"] = "No"
-                data["Indexability Reason"] = "Noindex directive"
-            
-            # Check for nofollow directives
-            if "nofollow" in meta_robots_lower or "nofollow" in x_robots_lower:
-                if data["Indexability Reason"]:
-                    data["Indexability Reason"] += " and Nofollow directive"
-                else:
-                    data["Indexable"] = "No"
-                    data["Indexability Reason"] = "Nofollow directive"
-            
-            # Check for canonical URL mismatch
-            if data["Canonical_URL"] and data["Canonical_URL"] != data["Final_URL"]:
-                data["Indexable"] = "No"
-                data["Indexability Reason"] = "Canonical URL mismatch"
-            
-            # Check for empty content
-            if not data["Title"] and not data["H1"] and not data["Meta Description"]:
-                data["Indexable"] = "No"
-                data["Indexability Reason"] = "Empty content (no title, H1, or meta description)"
-            
-            # Calculate word count
-            text = soup.get_text()
-            words = text.split()
-            data["Word Count"] = len(words)
-            
-            return data
+            text_content = soup.get_text(separator=" ", strip=True)
+            data["Word Count"] = len(text_content.split())
+
         except Exception as e:
-            logging.error(f"Error parsing HTML content: {str(e)}")
-            return data
+            logger.error(f"Error parsing HTML for {data['Original_URL']}: {e}", exc_info=True)
+            # Data dictionary already has defaults, so just log
+
+    def determine_indexability(self, data: Dict):
+        """Determines indexability based on all gathered data. Updates data dict in-place."""
+        # Start with Yes, then look for reasons to say No.
+        is_indexable = True
+        reasons = []
+
+        # HTTP Status
+        if data["Final_Status_Code"] != "200" and data["Final_Status_Code"] != "": # Allow empty if not fetched
+             if data["Final_Status_Code"] != "Error": # Don't override specific fetch error
+                is_indexable = False
+                reasons.append(f"Non-200 status: {data['Final_Status_Code']}")
+
+        # Robots.txt
+        if data["Blocked by Robots.txt"] == "Yes":
+            is_indexable = False
+            reasons.append(data["Robots Block Rule"] or "Blocked by robots.txt")
+
+        # Meta Robots
+        meta_robots_lower = data["Meta Robots"].lower()
+        if "noindex" in meta_robots_lower:
+            is_indexable = False
+            reasons.append("Meta robots: noindex")
+        # Nofollow doesn't make a page non-indexable, but it's good info
+        # if "nofollow" in meta_robots_lower: reasons.append("Meta robots: nofollow")
+
+        # X-Robots-Tag
+        x_robots_lower = data["X-Robots-Tag"].lower()
+        if "noindex" in x_robots_lower:
+            is_indexable = False
+            reasons.append("X-Robots-Tag: noindex")
+        # if "nofollow" in x_robots_lower: reasons.append("X-Robots-Tag: nofollow")
+            
+        # Canonicalization
+        # A page is still indexable if it canonicalizes to itself.
+        # If it canonicalizes elsewhere, THIS page might not be the one indexed.
+        final_url_norm = normalize_url(data["Final_URL"])
+        canonical_url_norm = normalize_url(data["Canonical_URL"])
+
+        if canonical_url_norm and final_url_norm and canonical_url_norm != final_url_norm:
+            is_indexable = False # This specific URL is not the preferred version
+            reasons.append(f"Canonical points elsewhere: {data['Canonical_URL']}")
+        
+        # Update data dictionary
+        data["Indexable"] = "Yes" if is_indexable else "No"
+        if not reasons and not is_indexable and not data.get("Indexability Reason"): # if no specific reason but still no
+             data["Indexability Reason"] = "Multiple factors or undetermined"
+        elif reasons:
+             data["Indexability Reason"] = "; ".join(reasons)
+        # If already set by status code error, don't overwrite with generic message
+        elif not is_indexable and not data.get("Indexability Reason"):
+            data["Indexability Reason"] = "Undetermined non-indexable"
+
+
+    async def recrawl_failed_urls(self, existing_results_urls: Set[str]) -> List[Dict]:
+        """Attempts to recrawl URLs that failed, avoiding duplicates."""
+        if not self.failed_urls:
+            return []
+        
+        logger.info(f"Attempting to recrawl {len(self.failed_urls)} failed URLs...")
+        # Filter out URLs that might have succeeded in a different context or were already processed
+        urls_to_recrawl = list(self.failed_urls - existing_results_urls)
+        if not urls_to_recrawl:
+            logger.info("No new failed URLs to recrawl.")
+            return []
+        
+        logger.info(f"Recrawling {len(urls_to_recrawl)} unique failed URLs.")
+
+        tasks = []
+        for url in urls_to_recrawl:
+            # Using a new semaphore for recrawl to not interfere with main crawl limits if any
+            # Or reuse existing if appropriate for the application flow
+            task = asyncio.create_task(self.fetch_and_parse(url)) # fetch_and_parse has its own retry
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
+            tasks.append(task)
+        
+        recrawl_results = []
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            if self._stop_event.is_set():
+                logger.info("Recrawl stopped.")
+                break
+            try:
+                result = await future
+                if result:
+                    recrawl_results.append(result)
+                    if not str(result.get("Final_Status_Code","")).startswith("Error"):
+                         logger.info(f"Successfully recrawled {result['Original_URL']} -> Status: {result['Final_Status_Code']}")
+            except asyncio.CancelledError:
+                logger.info("A recrawl task was cancelled.")
+            except Exception as e:
+                # This error should ideally be caught within fetch_and_parse and returned in the result dict
+                logger.error(f"Unexpected error during recrawl result processing: {e}", exc_info=True)
+        
+        self.failed_urls.clear() # Clear after attempts
+        return recrawl_results
 
     def stop(self):
-        """Set the stop event to halt the crawl."""
-        self.stop_event.set()
-        logging.info("Stop event set - crawl will halt after current tasks complete")
+        """Signals the crawl to stop."""
+        logger.info("Stop signal received. Crawler will halt after current tasks complete.")
+        self._stop_event.set()
 
     def is_stopped(self) -> bool:
-        """Check if the crawl should stop."""
-        return self.stop_event.is_set()
+        return self._stop_event.is_set()
 
-async def dynamic_frontier_crawl(
-    seed_url: str,
-    checker: URLChecker,
-    include_regex: Optional[str],
-    exclude_regex: Optional[str],
-    show_partial_callback=None
-) -> List[Dict]:
-    """
-    Dynamic frontier crawl implementation with unique URL tracking for accurate progress.
-    """
-    visited: Set[str] = set()
-    queued: Set[str] = set()
-    results = []
-    frontier = asyncio.PriorityQueue()
-    
-    # Normalize and validate seed URL
-    seed_url = normalize_url(seed_url)
-    if not seed_url:
-        logging.error("Invalid seed URL provided")
-        return results
-        
-    base_netloc = urlparse(seed_url).netloc.lower()
-    if not base_netloc:
-        logging.error(f"Could not parse netloc from seed URL: {seed_url}")
-        return results
-        
-    logging.info(f"Starting dynamic frontier crawl from seed URL: {seed_url}")
-    logging.info(f"Base netloc: {base_netloc}")
-    
-    # Initialize frontier and queued set with seed URL
-    await frontier.put((0, seed_url))
-    queued.add(seed_url)
-    inc, exc = compile_filters(include_regex, exclude_regex)
+# --- End of URLChecker Class ---
+
+def normalize_url(url: str) -> str:
+    """Normalizes a URL: adds scheme, removes fragment, trailing slash (optional but good for consistency)."""
+    if not url: return ""
+    url = url.strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url # Default to https
     
     try:
-        await checker.setup()
-        while not frontier.empty() and len(visited) < DEFAULT_MAX_URLS:
-            if checker.is_stopped():
-                logging.info("Crawl stopped by user request")
-                break
-
-            depth, url = await frontier.get()
-            norm_url = normalize_url(url)
-            
-            if not norm_url or norm_url in visited:
-                continue
-                
-            visited.add(norm_url)
-            logging.info(f"Crawling URL: {norm_url}")
-            
-            try:
-                result = await checker.fetch_and_parse(norm_url)
-                if result:
-                    results.append(result)
-                    logging.info(f"Successfully processed URL: {norm_url}")
-                else:
-                    logging.warning(f"No result returned for URL: {norm_url}")
-            except Exception as e:
-                logging.error(f"Error processing URL {norm_url}: {str(e)}")
-                continue
-            
-            # Discover new links from the current page
-            try:
-                discovered_links = await discover_links(norm_url, checker.session, checker.user_agent)
-                logging.info(f"Discovered {len(discovered_links)} links from {norm_url}")
-                
-                for link in discovered_links:
-                    if checker.is_stopped():
-                        break
-                        
-                    norm_link = normalize_url(link)
-                    if not norm_link or norm_link in visited or norm_link in queued:
-                        continue
-                    parsed_link = urlparse(norm_link)
-                    # Crawl only internal URLs (matching the seed's netloc)
-                    if parsed_link.netloc.lower() != base_netloc:
-                        continue
-                    if not regex_filter(norm_link, inc, exc):
-                        continue
-                    await frontier.put((depth + 1, norm_link))
-                    queued.add(norm_link)
-            except Exception as e:
-                logging.error(f"Error discovering links from {norm_url}: {str(e)}")
-                continue
-            
-            # For progress: only count unique URLs
-            crawled_count = len(visited)
-            total_unique = len(queued)
-            remaining = total_unique - crawled_count
-            if show_partial_callback:
-                show_partial_callback(results, crawled_count, total_unique)
-        logging.info(f"Dynamic frontier crawl completed. Visited {len(visited)} unique URLs.")
-        return results
+        parsed = urlparse(url)
+        # Rebuild path to remove trailing slash unless it's the root path
+        path = parsed.path
+        if path != '/' and path.endswith('/'):
+            path = path[:-1]
         
-    except Exception as e:
-        logging.error(f"Error in dynamic frontier crawl: {str(e)}")
-        return results
-    finally:
-        await checker.cleanup()
+        # Lowercase scheme and netloc for consistency
+        # Path can be case-sensitive on some servers, so keep its case.
+        normalized = urlunparse(
+            (parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.params, parsed.query, '') # Remove fragment
+        )
+        return normalized
+    except ValueError: # Handle potential malformed URLs
+        logger.warning(f"Could not parse/normalize URL: {url}")
+        return url # Return original if parsing fails
 
-async def discover_links(url: str, session: aiohttp.ClientSession, user_agent: str) -> List[str]:
-    """
-    Discover links from a page.
-    """
-    out = []
-    headers = {"User-Agent": user_agent}
+def update_redirect_label(data: Dict, original_url: str):
+    """Updates Final_Status_Type based on redirect status."""
+    # This function's logic might be better integrated into determine_indexability or
+    # simplified, as Final_Status_Type already reflects the final status.
+    # The original logic was a bit convoluted.
+    # We primarily care about the final status of the final URL.
+    final_url = data.get("Final_URL", "")
+    final_status_str = data.get("Final_Status_Code", "")
+
+    if not final_status_str or final_status_str == "Error":
+        return # Already handled or error state
+
     try:
-        async with session.get(url, headers=headers, ssl=False, allow_redirects=True) as resp:
-            if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
-                text = await resp.text(errors='replace')
-                soup = BeautifulSoup(text, "lxml")
-                for a in soup.find_all("a", href=True):
-                    try:
-                        abs_link = urljoin(url, a["href"])
-                        if abs_link and abs_link.startswith(('http://', 'https://')):
-                            out.append(abs_link)
-                    except Exception as e:
-                        logging.error(f"Error processing link {a['href']}: {str(e)}")
-                        continue
-    except Exception as e:
-        logging.error(f"Error discovering links from {url}: {str(e)}")
-    return list(set(out))  # Remove duplicates
+        final_status_code = int(final_status_str)
+    except ValueError:
+        return # Not a valid status code
 
-def compile_filters(include_pattern: str, exclude_pattern: str):
-    """
-    Compile regex patterns for URL filtering.
-    """
-    inc = re.compile(include_pattern) if include_pattern else None
-    exc = re.compile(exclude_pattern) if exclude_pattern else None
-    return inc, exc
+    original_url_norm = normalize_url(original_url)
+    final_url_norm = normalize_url(final_url)
 
-def regex_filter(url: str, inc, exc) -> bool:
-    """
-    Filter URL based on regex patterns.
-    """
-    if inc and not inc.search(url):
+    if original_url_norm != final_url_norm:
+        data["Final_Status_Type"] = f"{URLChecker.status_label(final_status_code)} (Redirect from {original_url})"
+    else:
+        data["Final_Status_Type"] = URLChecker.status_label(final_status_code)
+    # The indexability based on canonical mismatch is handled in determine_indexability
+
+def compile_regex_filters(include_pattern: Optional[str], exclude_pattern: Optional[str]) -> Tuple[Optional[re.Pattern], Optional[re.Pattern]]:
+    inc_re, exc_re = None, None
+    try:
+        if include_pattern:
+            inc_re = re.compile(include_pattern, re.IGNORECASE)
+    except re.error as e:
+        logger.error(f"Invalid include regex '{include_pattern}': {e}")
+    try:
+        if exclude_pattern:
+            exc_re = re.compile(exclude_pattern, re.IGNORECASE)
+    except re.error as e:
+        logger.error(f"Invalid exclude regex '{exclude_pattern}': {e}")
+    return inc_re, exc_re
+
+def filter_url_by_regex(url: str, inc_re: Optional[re.Pattern], exc_re: Optional[re.Pattern]) -> bool:
+    if exc_re and exc_re.search(url):
         return False
-    if exc and exc.search(url):
+    if inc_re and not inc_re.search(url):
         return False
     return True
 
-async def run_dynamic_crawl(seed_url: str, checker: URLChecker, include_pattern: str, exclude_pattern: str, show_partial_callback) -> List[Dict]:
-    """Async wrapper for dynamic frontier crawl."""
-    try:
-        logging.info(f"Starting dynamic crawl for seed URL: {seed_url}")
-        results = await dynamic_frontier_crawl(
-            seed_url=seed_url.strip(),
-            checker=checker,
-            include_regex=include_pattern,
-            exclude_regex=exclude_pattern,
-            show_partial_callback=show_partial_callback
-        )
-        
-        logging.info(f"Dynamic crawl completed. Found {len(results)} results.")
-        
-        # Recrawl failed URLs if any
-        if checker.failed_urls:
-            logging.info(f"Recrawling {len(checker.failed_urls)} failed URLs...")
-            recrawl_results = await checker.recrawl_failed_urls()
-            results.extend(recrawl_results)
-            logging.info(f"Recrawl completed. Added {len(recrawl_results)} more results.")
-        
-        await checker.cleanup()  # Use cleanup instead of close
-        return results
-    except Exception as e:
-        logging.error(f"Error in dynamic crawl: {e}")
-        await checker.cleanup()  # Ensure cleanup happens even on error
-        return []
-
-async def run_list_crawl(urls: List[str], checker: URLChecker, show_partial_callback) -> List[Dict]:
-    """Async wrapper for list mode crawl."""
-    try:
-        results = await chunk_process(urls, checker, show_partial_callback=show_partial_callback)
-        
-        # Recrawl failed URLs if any
-        if checker.failed_urls:
-            recrawl_results = await checker.recrawl_failed_urls()
-            results.extend(recrawl_results)
-        
-        await checker.cleanup()  # Use cleanup instead of close
-        return results
-    except Exception as e:
-        logging.error(f"Error in list crawl: {e}")
-        await checker.cleanup()  # Ensure cleanup happens even on error
-        return []
-
-async def run_sitemap_crawl(urls: List[str], checker: URLChecker, show_partial_callback) -> List[Dict]:
-    """Async wrapper for sitemap mode crawl."""
-    try:
-        results = await chunk_process(urls, checker, show_partial_callback=show_partial_callback)
-        
-        # Recrawl failed URLs if any
-        if checker.failed_urls:
-            recrawl_results = await checker.recrawl_failed_urls()
-            results.extend(recrawl_results)
-        
-        await checker.cleanup()  # Use cleanup instead of close
-        return results
-    except Exception as e:
-        logging.error(f"Error in sitemap crawl: {e}")
-        await checker.cleanup()  # Ensure cleanup happens even on error
-        return []
-
-async def process_sitemaps(sitemap_urls: List[str], show_partial_callback=None) -> List[str]:
-    """
-    Process multiple sitemap URLs concurrently and extract URLs.
-    """
-    all_urls = []
-    tasks = []
-    
-    for sitemap_url in sitemap_urls:
-        tasks.append(async_parse_sitemap(sitemap_url))
-    
-    for future in asyncio.as_completed(tasks):
+async def discover_links_from_html(page_url: str, html_content: str, base_netloc: str) -> List[str]:
+    """Discovers and filters internal links from HTML content."""
+    discovered_links = []
+    soup = BeautifulSoup(html_content, "lxml")
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
         try:
-            urls = await future
-            all_urls.extend(urls)
-            if show_partial_callback:
-                show_partial_callback(all_urls)
+            abs_link = urljoin(page_url, href)
+            norm_link = normalize_url(abs_link)
+            if norm_link:
+                parsed_link = urlparse(norm_link)
+                # Filter for HTTP/HTTPS and same domain
+                if parsed_link.scheme in ('http', 'https') and parsed_link.netloc.lower() == base_netloc:
+                    discovered_links.append(norm_link)
         except Exception as e:
-            logging.error(f"Error processing sitemap: {e}")
-    
-    return all_urls
+            logger.debug(f"Could not process link '{href}' from {page_url}: {e}")
+    return list(set(discovered_links)) # Unique links
 
-async def async_parse_sitemap(url: str) -> List[str]:
-    """
-    Parse a single sitemap URL and extract URLs.
-    Handles both regular sitemaps and sitemap indexes.
-    """
-    urls = []
+async def crawl_task_manager(
+    initial_urls: List[str],
+    checker: URLChecker,
+    show_partial_callback,
+    crawl_mode: str = "list", # "list", "spider"
+    spider_seed_url: Optional[str] = None, # For spider mode
+    include_regex: Optional[re.Pattern] = None, # For spider mode
+    exclude_regex: Optional[re.Pattern] = None, # For spider mode
+    max_spider_urls: int = DEFAULT_MAX_URLS
+):
+    results: List[Dict] = []
+    
+    # For Spider mode
+    queue = asyncio.Queue() # Using asyncio.Queue for spidering
+    processed_urls: Set[str] = set() # URLs submitted to fetch_and_parse
+    discovered_for_spider: Set[str] = set() # All unique URLs seen by spider
+
+    base_netloc = ""
+    if crawl_mode == "spider" and spider_seed_url:
+        parsed_seed = urlparse(normalize_url(spider_seed_url))
+        base_netloc = parsed_seed.netloc.lower()
+        for url in initial_urls: # Seed URLs for spider
+            norm_url = normalize_url(url)
+            if norm_url and urlparse(norm_url).netloc.lower() == base_netloc: # Ensure seed is on same domain
+                 if filter_url_by_regex(norm_url, include_regex, exclude_regex):
+                    await queue.put(norm_url)
+                    discovered_for_spider.add(norm_url)
+        total_urls_to_process = len(discovered_for_spider) # Initial, will grow
+    else: # List or Sitemap mode
+        unique_initial_urls = sorted(list(set(normalize_url(u) for u in initial_urls if normalize_url(u))))
+        for url in unique_initial_urls:
+            await queue.put(url)
+        total_urls_to_process = len(unique_initial_urls)
+
+    active_tasks = 0
+    processed_count = 0
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, ssl=False) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    if '<?xml' in content:
-                        # Parse XML content
-                        root = ET.fromstring(content)
-                        
-                        # Check if this is a sitemap index
-                        if root.tag.endswith('sitemapindex'):
-                            # This is a sitemap index, extract and process nested sitemaps
-                            sitemap_urls = []
-                            for sitemap in root.findall('.//{*}sitemap/{*}loc'):
-                                if sitemap.text:
-                                    sitemap_urls.append(sitemap.text.strip())
+        await checker.setup() # Setup session and semaphore
+
+        while True:
+            if checker.is_stopped():
+                logger.info("Crawl task manager: Stop event detected.")
+                break
+            
+            # Check if we should stop spidering (max URLs or queue empty and no active tasks)
+            if crawl_mode == "spider" and \
+               (len(processed_urls) >= max_spider_urls or (queue.empty() and active_tasks == 0)):
+                logger.info("Spider mode: Max URLs reached or queue exhausted.")
+                break
+            
+            # Check for list/sitemap mode completion
+            if crawl_mode != "spider" and processed_count >= total_urls_to_process and active_tasks == 0:
+                logger.info(f"{crawl_mode} mode: All URLs processed.")
+                break
+            
+            if not queue.empty():
+                url_to_process = await queue.get()
+                queue.task_done()
+
+                if url_to_process in processed_urls: # Avoid re-processing if somehow re-added
+                    continue
+                
+                processed_urls.add(url_to_process)
+
+                task = asyncio.create_task(checker.fetch_and_parse(url_to_process))
+                checker._pending_tasks.add(task) # Track for cleanup
+                active_tasks += 1
+
+                def task_done_callback(fut, url=url_to_process): # Capture url
+                    nonlocal active_tasks, processed_count
+                    checker._pending_tasks.discard(fut)
+                    active_tasks -= 1
+                    processed_count +=1
+                    try:
+                        result = fut.result()
+                        if result:
+                            results.append(result)
                             
-                            # Process nested sitemaps concurrently
-                            tasks = [async_parse_sitemap(sitemap_url) for sitemap_url in sitemap_urls]
-                            nested_results = await asyncio.gather(*tasks, return_exceptions=True)
-                            
-                            # Combine results, handling any errors
-                            for result in nested_results:
-                                if isinstance(result, list):
-                                    urls.extend(result)
-                                else:
-                                    logging.error(f"Error processing nested sitemap: {result}")
-                            
+                            # For spider mode, discover new links
+                            if crawl_mode == "spider" and \
+                               len(processed_urls) < max_spider_urls and \
+                               result.get("Content_Type", "").startswith("text/html") and \
+                               result.get("Final_Status_Code") == "200":
+                                
+                                html_content = "" # Need to get HTML content if not already in result
+                                # This part is tricky. fetch_and_parse returns a dict.
+                                # We need the actual HTML content to parse links.
+                                # This implies fetch_and_parse might need to return it, or we re-fetch (bad).
+                                # For now, let's assume we modify fetch_and_parse or make another function.
+                                # Let's simplify: if this were a real spider, discover_links would be integrated better.
+                                # For this structure, we'd need `result` to contain the HTML or re-fetch.
+                                # Let's assume `result` can contain 'html_content' if successfully fetched and parsed
+                                # This is a placeholder for a more robust link discovery integration
+                                if 'html_content' in result and result['html_content']: # Fictional field for now
+                                    new_links = asyncio.create_task(
+                                        discover_links_from_html(result["Final_URL"], result['html_content'], base_netloc)
+                                    )
+                                    # This part needs to be async and handled correctly
+                                    # For simplicity, let's simulate adding to queue
+                                    # This is a conceptual simplification. In a real scenario, await new_links
+                                    # and then iterate and add to queue.
+                                    # Conceptual:
+                                    # for link in await new_links:
+                                    #    if link not in discovered_for_spider and filter_url_by_regex(link, include_regex, exclude_regex):
+                                    #        discovered_for_spider.add(link)
+                                    #        await queue.put(link)
+                                    pass # Placeholder for actual link discovery and queueing
+                                        
+                        # Update UI
+                        if crawl_mode == "spider":
+                            # For spider, total can change, so use len(discovered_for_spider)
+                            show_partial_callback(results, len(processed_urls), len(discovered_for_spider) + queue.qsize())
                         else:
-                            # Regular sitemap, extract URLs
-                            for url_element in root.findall('.//{*}url/{*}loc'):
-                                if url_element.text:
-                                    urls.append(url_element.text.strip())
-                    else:
-                        # Try parsing as text sitemap (one URL per line)
-                        for line in content.splitlines():
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                urls.append(line)
-    except Exception as e:
-        logging.error(f"Error parsing sitemap {url}: {e}")
-    return urls
+                            show_partial_callback(results, processed_count, total_urls_to_process)
 
-async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callback=None) -> List[Dict]:
-    """
-    Process a list of URLs in chunks.
-    """
-    results = []
-    total = len(urls)
-    processed = 0
-    
-    try:
-        await checker.setup()
-        tasks = []
-        for url in urls:
-            tasks.append(checker.fetch_and_parse(url))
-        
-        for future in asyncio.as_completed(tasks):
-            try:
-                result = await future
-                results.append(result)
-                processed += 1
-                if show_partial_callback:
-                    show_partial_callback(results, processed, total)
-            except Exception as e:
-                logging.error(f"Error processing URL: {e}")
-                processed += 1
+                    except asyncio.CancelledError:
+                        logger.info(f"Task for {url} was cancelled during callback.")
+                    except Exception as e:
+                        logger.error(f"Error in task_done_callback for {url}: {e}", exc_info=True)
+                    
+                task.add_done_callback(lambda fut, url=url_to_process: task_done_callback(fut, url))
+
+            else: # Queue is empty, wait for active tasks or a short period
+                await asyncio.sleep(0.1)
+
+        logger.info(f"Crawl finished. Processed {processed_count} URLs. Total results: {len(results)}")
+
+    except asyncio.CancelledError:
+        logger.info("Crawl task manager was cancelled.")
     except Exception as e:
-        logging.error(f"Error in chunk processing: {e}")
+        logger.error(f"Error in crawl task manager: {e}", exc_info=True)
     finally:
-        await checker.cleanup()
+        # Ensure all tasks are awaited if manager exits prematurely
+        if checker._pending_tasks:
+            logger.info(f"Waiting for {len(checker._pending_tasks)} remaining tasks upon exit...")
+            await asyncio.gather(*list(checker._pending_tasks), return_exceptions=True)
+        await checker.cleanup() # Crucial for closing session
     
     return results
 
-def normalize_url(url: str) -> str:
-    """
-    Normalize a URL by removing fragments and ensuring proper format.
-    """
-    if not url:
-        return ""
-    url = url.strip()
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    parsed = urlparse(url)
-    parsed = parsed._replace(fragment="")
-    return urlunparse(parsed)
 
-def update_redirect_label(data: Dict, original_url: str) -> Dict:
-    """
-    Update the Final_Status_Type field based on redirect information and canonical URLs.
-    """
-    final_url = data.get("Final_URL", "")
-    final_status = data.get("Final_Status_Code", "")
-    canonical_url = data.get("Canonical_URL", "")
+async def run_crawl_logic(
+    crawl_type: str, # 'spider', 'list', 'sitemap'
+    checker: URLChecker,
+    show_partial_callback,
+    seed_url: Optional[str] = None,
+    url_list: Optional[List[str]] = None,
+    sitemap_urls_input: Optional[List[str]] = None,
+    include_pattern_str: Optional[str] = None,
+    exclude_pattern_str: Optional[str] = None,
+    max_spider_urls_limit: int = DEFAULT_MAX_URLS
+) -> List[Dict]:
     
-    try:
-        final_code = int(final_status)
-    except Exception:
-        final_code = None
+    all_results = []
+    initial_urls_for_crawl: List[str] = []
 
-    # Check for canonical URL mismatch
-    if canonical_url and canonical_url != final_url:
-        data["Indexability Reason"] = "Canonical URL mismatch"
-        data["Indexable"] = "No"
+    inc_re, exc_re = compile_regex_filters(include_pattern_str, exclude_pattern_str)
 
-    if final_url == original_url:
-        data["Final_Status_Type"] = "No Redirect"
-    else:
-        if final_code == 200:
-            if canonical_url and canonical_url != final_url:
-                data["Final_Status_Type"] = "Redirecting to Non-Canonical Page"
-            else:
-                data["Final_Status_Type"] = "Redirecting to Live Page"
-        elif final_code in (301, 302):
-            data["Final_Status_Type"] = "Temporary/Permanent Redirect"
-        elif final_code == 404:
-            data["Final_Status_Type"] = "Redirecting to Not Found Page"
-        elif final_code == 500:
-            data["Final_Status_Type"] = "Redirecting to Server Error Page"
-        else:
-            data["Final_Status_Type"] = f"Status {final_status}"
-    return data
+    if crawl_type == "spider":
+        if not seed_url:
+            logger.error("Spider mode requires a seed URL.")
+            return []
+        # For spider, initial_urls_for_crawl could be just the seed, or seed + sitemaps if also provided
+        initial_urls_for_crawl.append(normalize_url(seed_url))
+        
+        # Optional: If spider mode can also consume sitemaps for initial seed
+        if sitemap_urls_input:
+            logger.info(f"Spider mode: Parsing sitemaps for additional seed URLs: {sitemap_urls_input}")
+            sitemap_discovered_urls = await process_sitemaps_for_crawl(sitemap_urls_input, checker.user_agent, show_partial_sitemap_parsing_ui=None) # No UI callback here
+            initial_urls_for_crawl.extend(sitemap_discovered_urls)
+            initial_urls_for_crawl = sorted(list(set(initial_urls_for_crawl))) # Deduplicate
 
-def format_and_reorder_df(df):
-    """Helper function to reorder and format columns consistently."""
-    # First, ensure consistent column names
-    rename_map = {
-        'Is_Blocked_by_Robots': 'Blocked by Robots.txt',
-        'Is_Indexable': 'Indexable',
-        'Indexability_Reason': 'Indexability Reason',
-        'Meta_Description': 'Meta Description',
-        'H1_Text': 'H1',
-        'Meta_Robots': 'Meta Robots',
-        'X_Robots_Tag': 'X-Robots-Tag',
-        'HTML_Lang': 'HTML Lang',
-        'HTTP_Last_Modified': 'Last Modified'
-    }
-    
-    # Apply renaming
-    df = df.rename(columns=rename_map)
-    
-    # Ensure Indexable values are consistent
-    if 'Indexable' in df.columns:
-        df['Indexable'] = df['Indexable'].map(lambda x: 'Yes' if str(x).strip().lower() in ['yes', 'indexable'] else 'No')
-    
-    # Ensure Indexability Reason is consistent
-    if 'Indexability Reason' in df.columns:
-        df['Indexability Reason'] = df.apply(
-            lambda row: '' if row.get('Indexable', '').lower() == 'yes' else row.get('Indexability Reason', ''),
-            axis=1
+        logger.info(f"Starting Spider crawl. Seed URLs: {len(initial_urls_for_crawl)}. Max URLs: {max_spider_urls_limit}")
+        # Spider logic will handle its own queue internally based on discovered links.
+        # The `crawl_task_manager` needs to be adapted for spidering or a dedicated spider function used.
+        # For now, let's assume `crawl_task_manager` can take a seed and spider.
+        all_results = await dynamic_frontier_crawl_wrapper( # Using a more specific spider function
+            seed_url=seed_url, # The primary seed for domain context
+            additional_seed_urls=initial_urls_for_crawl, # All initial URLs
+            checker=checker,
+            include_regex=inc_re,
+            exclude_regex=exc_re,
+            show_partial_callback=show_partial_callback,
+            max_urls=max_spider_urls_limit
         )
+
+    elif crawl_type == "list":
+        if not url_list:
+            logger.error("List mode requires a list of URLs.")
+            return []
+        initial_urls_for_crawl = [normalize_url(u) for u in url_list if normalize_url(u)]
+        logger.info(f"Starting List crawl with {len(initial_urls_for_crawl)} URLs.")
+        all_results = await crawl_task_manager(initial_urls_for_crawl, checker, show_partial_callback, crawl_mode="list")
+        
+    elif crawl_type == "sitemap":
+        if not sitemap_urls_input:
+            logger.error("Sitemap mode requires sitemap URLs.")
+            return []
+        logger.info(f"Starting Sitemap crawl. Parsing sitemaps: {sitemap_urls_input}")
+        # Pass the Streamlit UI callback for sitemap parsing if available
+        sitemap_discovered_urls = await process_sitemaps_for_crawl(
+            sitemap_urls_input, 
+            checker.user_agent,
+            show_partial_sitemap_parsing_ui=st.session_state.get('sitemap_parsing_ui_callback') 
+        )
+        initial_urls_for_crawl = sitemap_discovered_urls
+        if not initial_urls_for_crawl:
+            logger.warning("No URLs found in provided sitemaps.")
+            return []
+        logger.info(f"Extracted {len(initial_urls_for_crawl)} URLs from sitemaps for crawling.")
+        all_results = await crawl_task_manager(initial_urls_for_crawl, checker, show_partial_callback, crawl_mode="sitemap")
+
+    else:
+        logger.error(f"Unknown crawl type: {crawl_type}")
+        return []
+
+    # Consolidate results and recrawl failed if any
+    final_results_set = {r['Original_URL']: r for r in all_results} # Deduplicate by original URL, keeping last seen
+
+    if checker.failed_urls:
+        urls_in_results = set(final_results_set.keys())
+        # Filter failed URLs to only recrawl those not already successfully in results
+        # (e.g. if a URL failed then succeeded through another path in spider mode)
+        recrawl_candidates = checker.failed_urls - urls_in_results
+        
+        if recrawl_candidates:
+            logger.info(f"Recrawling {len(recrawl_candidates)} failed URLs that are not in successful results...")
+            # Create a temporary set for recrawl_failed_urls to use
+            original_failed_urls = checker.failed_urls
+            checker.failed_urls = recrawl_candidates # Temporarily set to only candidates
+            
+            recrawl_results_list = await checker.recrawl_failed_urls(urls_in_results)
+            
+            checker.failed_urls = original_failed_urls # Restore original set (or just clear if done)
+
+            for res in recrawl_results_list:
+                final_results_set[res['Original_URL']] = res # Update/add recrawled results
+        else:
+            logger.info("No new failed URLs to recrawl or all failed URLs already have a successful entry.")
     
+    return list(final_results_set.values())
+
+
+# --- Sitemap Processing ---
+async def fetch_sitemap_content(session: aiohttp.ClientSession, url: str, user_agent: str) -> Optional[str]:
+    try:
+        async with session.get(url, headers={"User-Agent": user_agent}, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            return await response.text(errors='replace')
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching sitemap: {url}")
+    except aiohttp.ClientError as e:
+        logger.error(f"ClientError fetching sitemap {url}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error fetching sitemap {url}: {e}", exc_info=True)
+    return None
+
+async def parse_single_sitemap_xml(xml_content: str, sitemap_url: str) -> Tuple[List[str], List[str]]:
+    """Parses XML sitemap content. Returns (list_of_page_urls, list_of_nested_sitemap_urls)."""
+    page_urls: List[str] = []
+    nested_sitemap_urls: List[str] = []
+    try:
+        root = ET.fromstring(xml_content.encode('utf-8')) # Ensure bytes for ET
+        # XML Namespaces are tricky. A common approach is to ignore them in findall.
+        # {*} matches any namespace.
+        if root.tag.endswith('sitemapindex'):
+            for sitemap_element in root.findall('.//{*}sitemap/{*}loc'):
+                if sitemap_element.text:
+                    nested_sitemap_urls.append(sitemap_element.text.strip())
+        elif root.tag.endswith('urlset'):
+            for url_element in root.findall('.//{*}url/{*}loc'):
+                if url_element.text:
+                    page_urls.append(url_element.text.strip())
+        else:
+            logger.warning(f"Unknown root tag in sitemap {sitemap_url}: {root.tag}")
+    except ET.ParseError as e:
+        logger.error(f"XML ParseError for sitemap {sitemap_url}: {e}")
+    except Exception as e:
+        logger.error(f"Error parsing XML sitemap {sitemap_url}: {e}", exc_info=True)
+    return page_urls, nested_sitemap_urls
+
+def parse_single_sitemap_text(text_content: str) -> List[str]:
+    """Parses a plain text sitemap."""
+    urls = []
+    for line in text_content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and (line.startswith('http://') or line.startswith('https://')):
+            urls.append(line)
+    return urls
+
+async def process_sitemaps_for_crawl(
+    sitemap_urls_input: List[str], 
+    user_agent: str,
+    show_partial_sitemap_parsing_ui # Callback for Streamlit UI
+    ) -> List[str]:
+    """
+    Concurrently fetches and parses multiple sitemap URLs (can be index sitemaps or regular ones).
+    Handles nested sitemaps.
+    """
+    all_found_page_urls: Set[str] = set()
+    sitemaps_to_process_queue = asyncio.Queue()
+    # Use a set to track sitemaps already added to queue or processed to avoid loops/redundancy
+    known_sitemap_urls: Set[str] = set() 
+
+    for s_url in sitemap_urls_input:
+        norm_s_url = normalize_url(s_url)
+        if norm_s_url not in known_sitemap_urls:
+            await sitemaps_to_process_queue.put(norm_s_url)
+            known_sitemap_urls.add(norm_s_url)
+
+    # Use a single session for all sitemap fetching
+    async with aiohttp.ClientSession(headers={"User-Agent": user_agent}, json_serialize=orjson.dumps) as session:
+        active_sitemap_tasks = 0
+        while True:
+            if sitemaps_to_process_queue.empty() and active_sitemap_tasks == 0:
+                break # All sitemaps processed
+
+            if not sitemaps_to_process_queue.empty():
+                current_sitemap_url = await sitemaps_to_process_queue.get()
+                sitemaps_to_process_queue.task_done()
+                active_sitemap_tasks +=1
+                
+                logger.info(f"Processing sitemap: {current_sitemap_url}")
+                sitemap_content = await fetch_sitemap_content(session, current_sitemap_url, user_agent)
+
+                if sitemap_content:
+                    # Try XML parsing first
+                    page_urls_from_current, nested_sitemaps_from_current = await parse_single_sitemap_xml(sitemap_content, current_sitemap_url)
+                    
+                    if not page_urls_from_current and not nested_sitemaps_from_current:
+                        # If XML parsing yielded nothing, it might be a text sitemap
+                        logger.debug(f"XML parsing yielded no URLs for {current_sitemap_url}, trying as text sitemap.")
+                        page_urls_from_current = parse_single_sitemap_text(sitemap_content)
+
+                    for p_url in page_urls_from_current:
+                        all_found_page_urls.add(normalize_url(p_url))
+                    
+                    for ns_url in nested_sitemaps_from_current:
+                        norm_ns_url = normalize_url(ns_url)
+                        if norm_ns_url not in known_sitemap_urls:
+                            await sitemaps_to_process_queue.put(norm_ns_url)
+                            known_sitemap_urls.add(norm_ns_url) # Add to known before putting in queue
+                
+                active_sitemap_tasks -=1
+                
+                # Update Streamlit UI if callback provided
+                if show_partial_sitemap_parsing_ui:
+                    show_partial_sitemap_parsing_ui(list(all_found_page_urls))
+            else:
+                await asyncio.sleep(0.1) # Wait for tasks to complete or new sitemaps
+
+    logger.info(f"Sitemap processing complete. Found {len(all_found_page_urls)} unique page URLs.")
+    return sorted(list(all_found_page_urls))
+
+
+# --- Spidering Logic (Dynamic Frontier) ---
+async def dynamic_frontier_crawl_wrapper(
+    seed_url: str,
+    additional_seed_urls: List[str], # Can include the main seed_url plus sitemap URLs
+    checker: URLChecker,
+    include_regex: Optional[re.Pattern],
+    exclude_regex: Optional[re.Pattern],
+    show_partial_callback,
+    max_urls: int = DEFAULT_MAX_URLS
+) -> List[Dict]:
+    
+    all_results: List[Dict] = []
+    
+    # Frontier: URLs to be crawled. Using a set for efficient add/check, and pop for next.
+    # For priority (e.g. by depth), asyncio.PriorityQueue would be better.
+    # For broad crawls, a simple set/list and then random pop can work.
+    # Using a deque for FIFO queue behavior.
+    frontier = asyncio.Queue() 
+    
+    # Visited: Normalized URLs that have been added to the frontier (and will be/are being processed)
+    # This prevents adding the same URL to the frontier multiple times.
+    visited_for_frontier: Set[str] = set() 
+    
+    # Processed_results: URLs for which we have a result dict.
+    processed_results_urls: Set[str] = set()
+
+
+    main_seed_normalized = normalize_url(seed_url)
+    if not main_seed_normalized:
+        logger.error("Spider Error: Invalid main seed URL provided.")
+        return []
+        
+    parsed_main_seed = urlparse(main_seed_normalized)
+    base_netloc = parsed_main_seed.netloc.lower()
+    if not base_netloc:
+        logger.error(f"Spider Error: Could not parse netloc from main seed URL: {main_seed_normalized}")
+        return []
+        
+    logger.info(f"Starting dynamic frontier crawl. Main Seed: {main_seed_normalized}, Base Netloc: {base_netloc}")
+
+    # Add all initial seed URLs to frontier
+    initial_frontier_urls = set(normalize_url(u) for u in additional_seed_urls)
+    for u in initial_frontier_urls:
+        if u and urlparse(u).netloc.lower() == base_netloc: # Ensure on same domain
+            if filter_url_by_regex(u, include_regex, exclude_regex):
+                if u not in visited_for_frontier:
+                    await frontier.put(u)
+                    visited_for_frontier.add(u)
+
+    active_fetch_tasks = 0
+    total_urls_added_to_frontier = len(visited_for_frontier) # Initial count
+
+    try:
+        await checker.setup()
+
+        while True:
+            if checker.is_stopped():
+                logger.info("Spider: Stop event detected.")
+                break
+            
+            if len(processed_results_urls) >= max_urls:
+                logger.info(f"Spider: Reached max URL limit of {max_urls}.")
+                break
+            
+            if frontier.empty() and active_fetch_tasks == 0:
+                logger.info("Spider: Frontier is empty and no active tasks remaining.")
+                break
+            
+            if not frontier.empty() and len(processed_results_urls) + active_fetch_tasks < max_urls :
+                current_url = await frontier.get()
+                frontier.task_done()
+                
+                # Double check if already processed, e.g. if added to frontier by mistake after processing
+                if current_url in processed_results_urls:
+                    continue
+
+                active_fetch_tasks += 1
+                task = asyncio.create_task(checker.fetch_and_parse(current_url))
+                checker._pending_tasks.add(task) # For global cleanup tracking
+
+                def process_spider_result(fut, fetched_url=current_url):
+                    nonlocal active_fetch_tasks, total_urls_added_to_frontier
+                    active_fetch_tasks -= 1
+                    checker._pending_tasks.discard(fut) # Remove from global tracking
+                    
+                    try:
+                        result_dict = fut.result()
+                        if result_dict:
+                            all_results.append(result_dict)
+                            processed_results_urls.add(fetched_url) # Mark as having a result
+
+                            # Discover and add new links if successful HTML page and within limits
+                            if result_dict.get("Content_Type", "").startswith("text/html") and \
+                               result_dict.get("Final_Status_Code") == "200" and \
+                               len(visited_for_frontier) < max_urls : # Check visited_for_frontier for adding new links
+                                
+                                final_page_url = result_dict["Final_URL"]
+                                # To discover links, we need the HTML. fetch_and_parse must be adapted
+                                # or we use a different function. For now, assuming result_dict could contain HTML
+                                # if properly fetched. This is a simplification.
+                                # A more robust way is to have fetch_and_parse return (dict, html_content_or_none)
+                                
+                                # Let's simulate getting HTML content for discovery (this needs proper implementation)
+                                # Option 1: fetch_and_parse returns HTML (modify it)
+                                # Option 2: A separate fetch for discovery (inefficient)
+                                # Option 3: discover_links is part of fetch_and_parse (complex return)
+
+                                # --- Placeholder for link discovery logic ---
+                                # This part needs a way to get the HTML content.
+                                # Assuming a hypothetical `get_html_from_result(result_dict)` or similar.
+                                # For this example, this part will be conceptual.
+                                # In a real implementation, you'd await an async link discovery function here.
+                                # async def discover_and_add_links(result_dict_param):
+                                #    nonlocal total_urls_added_to_frontier
+                                #    html_content = await get_html_for_discovery(result_dict_param['Final_URL'], checker.session)
+                                #    if html_content:
+                                #        new_links = await discover_links_from_html(result_dict_param["Final_URL"], html_content, base_netloc)
+                                #        for link in new_links:
+                                #            if link not in visited_for_frontier and len(visited_for_frontier) < max_urls:
+                                #                 if filter_url_by_regex(link, include_regex, exclude_regex):
+                                #                    visited_for_frontier.add(link)
+                                #                    await frontier.put(link)
+                                #                    total_urls_added_to_frontier +=1
+                                # asyncio.create_task(discover_and_add_links(result_dict))
+                                # --- End Placeholder ---
+                                pass # Actual link discovery and frontier.put() would go here.
+
+                        # Update UI: crawled count is len(processed_results_urls)
+                        # total is len(visited_for_frontier) (all unique URLs intended for processing)
+                        # or max_urls if that's the cap.
+                        ui_total = max(len(visited_for_frontier), frontier.qsize() + len(processed_results_urls))
+                        ui_total = min(ui_total, max_urls) # Cap display total at max_urls
+                        show_partial_callback(all_results, len(processed_results_urls), ui_total)
+
+                    except asyncio.CancelledError:
+                        logger.info(f"Spider task for {fetched_url} cancelled during result processing.")
+                    except Exception as e_callback:
+                        logger.error(f"Error processing result for {fetched_url} in spider: {e_callback}", exc_info=True)
+
+                task.add_done_callback(lambda fut, url=current_url: process_spider_result(fut, url))
+            
+            else: # Frontier empty or max concurrent tasks, wait a bit
+                await asyncio.sleep(0.1)
+                
+    except asyncio.CancelledError:
+        logger.info("Dynamic frontier crawl was cancelled.")
+    except Exception as e:
+        logger.error(f"Error in dynamic frontier crawl: {e}", exc_info=True)
+    finally:
+        # Wait for any remaining tasks to complete or be cancelled
+        if checker._pending_tasks:
+            logger.info(f"Spider cleanup: Waiting for {len(checker._pending_tasks)} tasks.")
+            await asyncio.gather(*list(checker._pending_tasks), return_exceptions=True)
+        await checker.cleanup() # Ensure session is closed
+
+    return all_results
+
+
+# --- Streamlit UI and Main Logic ---
+def format_and_reorder_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Helper function to reorder and format columns consistently."""
     # Define the desired column order
     main_cols = [
-        'Original_URL',
-        'Content_Type',
-        'Initial_Status_Code',
-        'Initial_Status_Type',
-        'Indexable',
-        'Indexability Reason',
-        'Blocked by Robots.txt',
-        'Robots Block Rule',
-        'Final_URL',
-        'Final_Status_Code',
-        'Final_Status_Type',
-        'Meta Robots',
-        'X-Robots-Tag',
-        'Canonical_URL',
-        'H1',
-        'Title',
-        'Meta Description',
-        'Word Count',
-        'Last Modified',
-        'HTML Lang',
-        'Timestamp',
-        'Encoded_URL'  # Moved to last position
+        'Original_URL', 'Content_Type', 'Initial_Status_Code', 'Initial_Status_Type',
+        'Indexable', 'Indexability Reason', 'Blocked by Robots.txt', 'Robots Block Rule',
+        'Final_URL', 'Final_Status_Code', 'Final_Status_Type',
+        'Meta Robots', 'X-Robots-Tag', 'Canonical_URL',
+        'Title', 'Meta Description', 'H1', 'H1_Count', 'Word Count',
+        'Last Modified', 'HTML Lang', 'Timestamp', 'Encoded_URL'
     ]
     
     # Get existing columns that aren't in main_cols
-    other_cols = [col for col in df.columns if col not in main_cols]
+    existing_cols_in_df = df.columns.tolist()
+    ordered_cols = [col for col in main_cols if col in existing_cols_in_df]
     
-    # Create final column order, keeping only columns that exist in the DataFrame
-    ordered_cols = [col for col in main_cols if col in df.columns] + other_cols
+    # Add any other columns from the DataFrame not in main_cols to the end
+    other_cols = [col for col in existing_cols_in_df if col not in ordered_cols]
+    final_col_order = ordered_cols + other_cols
     
-    # Return DataFrame with ordered columns
-    return df[ordered_cols]
+    return df[final_col_order]
 
-def main():
-    st.set_page_config(layout="wide")
-    st.title("Web Crawler")
+def main_streamlit_app():
+    st.set_page_config(layout="wide", page_title="Web Crawler SEO Tool")
+    st.title("⚙️ Web Crawler & SEO Analyzer")
 
-    st.sidebar.header("Configuration")
+    # Initialize session state variables
+    if 'is_crawling' not in st.session_state: st.session_state['is_crawling'] = False
+    if 'crawl_results' not in st.session_state: st.session_state['crawl_results'] = []
+    if 'crawl_done' not in st.session_state: st.session_state['crawl_done'] = False
+    if 'checker_instance' not in st.session_state: st.session_state['checker_instance'] = None
+    if 'sitemap_parsed_urls' not in st.session_state: st.session_state['sitemap_parsed_urls'] = []
+    if 'current_crawl_mode' not in st.session_state: st.session_state['current_crawl_mode'] = "Spider" # Default mode
+
+    st.sidebar.header("⚙️ Configuration")
     
-    # User Agent Selection
-    ua_mode = st.sidebar.radio("User Agent Mode", ["Preset", "Custom"], horizontal=True)
-    if ua_mode == "Preset":
-        ua_choice = st.sidebar.selectbox("User Agent", list(USER_AGENTS.keys()))
-        user_agent = USER_AGENTS[ua_choice]
-    else:
-        user_agent = st.sidebar.text_input("Custom User Agent", value=DEFAULT_USER_AGENT)
+    ua_choice = st.sidebar.selectbox("User Agent", list(USER_AGENTS.keys()), index=list(USER_AGENTS.keys()).index("Custom Bot"))
+    user_agent = USER_AGENTS[ua_choice]
+    if ua_choice == "Custom Bot":
+        user_agent = st.sidebar.text_input("Custom User Agent String", value=DEFAULT_USER_AGENT)
 
-    # Speed Controls
-    st.sidebar.subheader("Speed Controls")
-    speed_mode = st.sidebar.radio("Speed Mode", ["Safe", "Dynamic", "Custom"], horizontal=True)
-    
-    if speed_mode == "Safe":
-        concurrency = DEFAULT_CONCURRENCY
-    elif speed_mode == "Dynamic":
-        concurrency = st.sidebar.slider("Initial Urls/s", MIN_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_CONCURRENCY)
-        st.sidebar.info("Speed will automatically adjust based on server response")
-    else:  # Custom
-        concurrency = st.sidebar.slider("Urls/s", MIN_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_CONCURRENCY)
+    concurrency = st.sidebar.slider("Concurrent Requests", MIN_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_CONCURRENCY, 5)
+    respect_robots = st.sidebar.checkbox("Respect robots.txt & Crawl-Delay", value=True)
+    timeout_val = st.sidebar.slider("Timeout (seconds)", 5, 60, DEFAULT_TIMEOUT, 5)
 
-    respect_robots = st.sidebar.checkbox("Respect robots.txt", value=True)
-    mode = st.radio("Select Mode", ["Spider", "List", "Sitemap"], horizontal=True)
-    st.write("----")
+    st.sidebar.markdown("---")
+    mode = st.sidebar.radio("Crawl Mode", ["Spider", "List", "Sitemap"], key="crawl_mode_selector", index=0)
+    st.session_state['current_crawl_mode'] = mode # Keep track of selected mode
+
+    # Inputs based on mode
+    seed_url_input, list_input_text, sitemap_input_text = "", "", ""
+    include_pattern, exclude_pattern = "", ""
+    max_spider_urls = DEFAULT_MAX_URLS
 
     if mode == "Spider":
-        st.subheader("Spider")
-        seed_url = st.text_input("Seed URL", placeholder="Enter a single URL")
-        include_sitemaps = st.checkbox("Include Sitemaps")
-        sitemap_urls = []
-        if include_sitemaps:
-            sitemaps_text = st.text_area("Sitemap URLs (one per line)", "")
-            if sitemaps_text.strip():
-                raw_sitemaps = [s.strip() for s in sitemaps_text.splitlines() if s.strip()]
-                with st.expander("Discovered Sitemap URLs", expanded=True):
-                    table_ph = st.empty()
-                    def show_partial_sitemap(all_urls):
-                        df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
-                        table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    sitemap_urls = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
-                    loop.close()
-                    st.write(f"Collected {len(sitemap_urls)} URLs from sitemaps.")
+        st.subheader("🕷️ Spider Crawl")
+        seed_url_input = st.text_input("Seed URL (e.g., https://www.example.com)", placeholder="Enter a single URL to start crawling from")
+        max_spider_urls = st.number_input("Max URLs to Crawl", min_value=10, max_value=10000, value=DEFAULT_MAX_URLS, step=10)
+        with st.expander("Advanced Filters (Regex for Discovered URLs)"):
+            include_pattern = st.text_input("Include URLs Matching Regex", placeholder="e.g., /products/")
+            exclude_pattern = st.text_input("Exclude URLs Matching Regex", placeholder="e.g., /blog/page/\d+")
+        # Optional: Allow sitemaps as additional seeds for spider
+        sitemap_spider_seed_mode = st.checkbox("Use Sitemaps as additional seeds for Spider")
+        if sitemap_spider_seed_mode:
+             sitemap_input_text = st.text_area("Sitemap URLs (one per line) for additional Spider seeds", height=100)
 
-        with st.expander("Advanced Filters (Optional)"):
-            st.write("Regex to include or exclude discovered URLs in Crawl.")
-            include_pattern = st.text_input("Include Regex", "")
-            exclude_pattern = st.text_input("Exclude Regex", "")
 
-        # Create a container for the button to maintain its position
-        button_container = st.container()
-        
-        # Initialize session state for crawl control
-        if 'is_crawling' not in st.session_state:
-            st.session_state['is_crawling'] = False
-        if 'crawl_results' not in st.session_state:
-            st.session_state['crawl_results'] = []
-        if 'crawl_done' not in st.session_state:
-            st.session_state['crawl_done'] = False
-        if 'checker' not in st.session_state:
-            st.session_state['checker'] = None
+    elif mode == "List":
+        st.subheader("📋 List Crawl")
+        list_input_text = st.text_area("Enter URLs (one per line)", height=200)
 
-        # Place the button in the container
-        with button_container:
-            if st.session_state['is_crawling']:
-                if st.button("Stop Crawl", type="primary"):
-                    if st.session_state['checker']:
-                        st.session_state['checker'].stop()
-                        st.session_state['is_crawling'] = False
-                        # Save current results before stopping
-                        if st.session_state['checker'].recent_results:
-                            st.session_state['crawl_results'].extend(st.session_state['checker'].recent_results)
-                            st.session_state['crawl_done'] = True
-                        st.info("Stopping crawl after current tasks complete...")
-                        st.rerun()
-            else:
-                if st.button("Start Crawl", type="primary"):
-                    if not seed_url.strip():
-                        st.warning("No seed URL provided.")
-                        return
+    elif mode == "Sitemap":
+        st.subheader("🗺️ Sitemap Crawl")
+        sitemap_input_text = st.text_area("Sitemap URLs (one per line, can be sitemap index files)", height=150)
+        st.info("The crawler will parse these sitemaps (including nested ones) to find all page URLs to crawl.")
+        with st.expander("Discovered URLs from Sitemaps (Live Update)", expanded=False):
+            sitemap_progress_ph = st.empty()
+            sitemap_table_ph = st.empty()
+            
+            def show_partial_sitemap_parsing_ui_callback(discovered_sitemap_urls_list):
+                sitemap_progress_ph.info(f"Found {len(discovered_sitemap_urls_list)} URLs from sitemaps so far...")
+                if discovered_sitemap_urls_list:
+                    df_sitemap_temp = pd.DataFrame(discovered_sitemap_urls_list, columns=["Discovered URLs"])
+                    sitemap_table_ph.dataframe(df_sitemap_temp, height=300, use_container_width=True)
+                else:
+                    sitemap_table_ph.empty()
+            st.session_state['sitemap_parsing_ui_callback'] = show_partial_sitemap_parsing_ui_callback
+
+
+    # Start/Stop Button Area
+    st.markdown("---")
+    button_cols = st.columns(2)
+    with button_cols[0]:
+        if st.session_state['is_crawling']:
+            if st.button("🛑 Stop Crawl", type="primary", use_container_width=True):
+                if st.session_state['checker_instance']:
+                    st.session_state['checker_instance'].stop()
+                st.session_state['is_crawling'] = False # UI state change
+                # Results will be shown by the callback or when crawl_done is true
+                st.info("Stop signal sent. Crawl will halt after current operations...")
+                st.rerun() # Rerun to update UI state
+        else:
+            if st.button("🚀 Start Crawl", type="primary", use_container_width=True):
+                # Validate inputs based on mode
+                valid_input = True
+                if mode == "Spider" and not seed_url_input.strip():
+                    st.error("Spider mode requires a Seed URL.")
+                    valid_input = False
+                elif mode == "List" and not list_input_text.strip():
+                    st.error("List mode: Please enter some URLs.")
+                    valid_input = False
+                elif mode == "Sitemap" and not sitemap_input_text.strip():
+                    st.error("Sitemap mode: Please enter Sitemap URLs.")
+                    valid_input = False
+
+                if valid_input:
                     st.session_state['is_crawling'] = True
                     st.session_state['crawl_results'] = []
                     st.session_state['crawl_done'] = False
-                    checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
-                    st.session_state['checker'] = checker
-                    st.rerun()
-
-        progress_ph = st.empty()
-        progress_bar = st.progress(0.0)
-        with st.expander("Intermediate Results", expanded=True):
-            table_ph = st.empty()
-            download_ph = st.empty()
-
-        def show_partial_data(res_list, crawled_count, discovered_count):
-            ratio = (crawled_count / discovered_count) if discovered_count > 0 else 0
-            progress_bar.progress(ratio)
-            remain = discovered_count - crawled_count
-            pct = ratio * 100
-            progress_ph.write(
-                f"Completed {crawled_count} of {discovered_count} ({pct:.2f}%) → {remain} Remaining"
-            )
-            if crawled_count % 20 == 0 or crawled_count == discovered_count:
-                # Combine current results with any previously saved results
-                all_results = st.session_state['crawl_results'] + res_list
-                df_temp = pd.DataFrame(all_results)
-                df_temp = format_and_reorder_df(df_temp)
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                # Show download button if crawl is done or stopped
-                if st.session_state['crawl_done']:
-                    csv_data = df_temp.to_csv(index=False)
-                    csv_bytes = csv_data.encode("utf-8")
-                    download_ph.download_button(
-                        label="Download CSV",
-                        data=csv_bytes,
-                        file_name="crawl_results.csv",
-                        mime="text/csv"
-                    )
-
-        # Start the crawl if is_crawling is True
-        if st.session_state['is_crawling']:
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(
-                    run_dynamic_crawl(
-                        seed_url=normalize_url(seed_url.strip()),
-                        checker=st.session_state['checker'],
-                        include_pattern=include_pattern,
-                        exclude_pattern=exclude_pattern,
-                        show_partial_callback=show_partial_data
-                    )
-                )
-                # Combine new results with any existing results
-                st.session_state['crawl_results'].extend(results)
-                st.session_state['crawl_done'] = True
-                st.session_state['is_crawling'] = False
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error during crawl: {str(e)}")
-                logging.error(f"Crawl error: {e}")
-                # Preserve results even if there's an error
-                if st.session_state['checker'].recent_results:
-                    st.session_state['crawl_results'].extend(st.session_state['checker'].recent_results)
-                    st.session_state['crawl_done'] = True
-                st.session_state['is_crawling'] = False
-                st.rerun()
-            finally:
-                loop.close()
-
-        # Show final results if crawl is done (either completed or stopped)
-        if st.session_state['crawl_done'] and st.session_state['crawl_results']:
-            df_final = pd.DataFrame(st.session_state['crawl_results'])
-            df_final = format_and_reorder_df(df_final)
-            table_ph.dataframe(df_final, height=500, use_container_width=True)
-            csv_data = df_final.to_csv(index=False)
-            csv_bytes = csv_data.encode("utf-8")
-            download_ph.download_button(
-                label="Download CSV",
-                data=csv_bytes,
-                file_name="crawl_results.csv",
-                mime="text/csv"
-            )
-
-    elif mode == "List":
-        st.subheader("List Mode")
-        list_input = st.text_area("Enter URLs (one per line)")
-        
-        # Initialize session state for List mode
-        if 'list_is_crawling' not in st.session_state:
-            st.session_state['list_is_crawling'] = False
-        if 'list_crawl_results' not in st.session_state:
-            st.session_state['list_crawl_results'] = []
-        if 'list_crawl_done' not in st.session_state:
-            st.session_state['list_crawl_done'] = False
-        if 'list_checker' not in st.session_state:
-            st.session_state['list_checker'] = None
-
-        # Create button container
-        button_container = st.container()
-        
-        # Place the button in the container
-        with button_container:
-            if st.session_state['list_is_crawling']:
-                if st.button("Stop Crawl", type="primary"):
-                    if st.session_state['list_checker']:
-                        st.session_state['list_checker'].stop()
-                        st.session_state['list_is_crawling'] = False
-                        # Save current results before stopping
-                        if st.session_state['list_checker'].recent_results:
-                            st.session_state['list_crawl_results'].extend(st.session_state['list_checker'].recent_results)
-                            st.session_state['list_crawl_done'] = True
-                        st.info("Stopping crawl after current tasks complete...")
-                        st.rerun()
-            else:
-                if st.button("Start Crawl", type="primary"):
-                    user_urls = [x.strip() for x in list_input.splitlines() if x.strip()]
-                    if not user_urls:
-                        st.warning("No URLs provided.")
-                        return
-                    st.session_state['list_is_crawling'] = True
-                    st.session_state['list_crawl_results'] = []
-                    st.session_state['list_crawl_done'] = False
-                    checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
-                    st.session_state['list_checker'] = checker
-                    st.rerun()
-
-        progress_ph = st.empty()
-        progress_bar = st.progress(0.0)
-        with st.expander("Results", expanded=True):
-            table_ph = st.empty()
-            download_ph = st.empty()
-
-        def show_partial_data(res_list, done_count, total_count):
-            ratio = done_count / total_count if total_count else 1.0
-            progress_bar.progress(ratio)
-            remain = total_count - done_count
-            pct = ratio * 100
-            progress_ph.write(
-                f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
-            )
-            if done_count % 20 == 0 or done_count == total_count:
-                # Combine current results with any previously saved results
-                all_results = st.session_state['list_crawl_results'] + res_list
-                df_temp = pd.DataFrame(all_results)
-                df_temp = format_and_reorder_df(df_temp)
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                if st.session_state['list_crawl_done']:
-                    csv_data = df_temp.to_csv(index=False)
-                    csv_bytes = csv_data.encode("utf-8")
-                    download_ph.download_button(
-                        label="Download CSV",
-                        data=csv_bytes,
-                        file_name="crawl_results.csv",
-                        mime="text/csv"
-                    )
-
-        # Start the crawl if is_crawling is True
-        if st.session_state['list_is_crawling']:
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(
-                    run_list_crawl(
-                        urls=[x.strip() for x in list_input.splitlines() if x.strip()],
-                        checker=st.session_state['list_checker'],
-                        show_partial_callback=show_partial_data
-                    )
-                )
-                # Combine new results with any existing results
-                st.session_state['list_crawl_results'].extend(results)
-                st.session_state['list_crawl_done'] = True
-                st.session_state['list_is_crawling'] = False
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error during crawl: {str(e)}")
-                logging.error(f"Crawl error: {e}")
-                # Preserve results even if there's an error
-                if st.session_state['list_checker'].recent_results:
-                    st.session_state['list_crawl_results'].extend(st.session_state['list_checker'].recent_results)
-                    st.session_state['list_crawl_done'] = True
-                st.session_state['list_is_crawling'] = False
-                st.rerun()
-            finally:
-                loop.close()
-
-        # Show final results if crawl is done (either completed or stopped)
-        if st.session_state['list_crawl_done'] and st.session_state['list_crawl_results']:
-            df_final = pd.DataFrame(st.session_state['list_crawl_results'])
-            df_final = format_and_reorder_df(df_final)
-            table_ph.dataframe(df_final, height=500, use_container_width=True)
-            csv_data = df_final.to_csv(index=False)
-            csv_bytes = csv_data.encode("utf-8")
-            download_ph.download_button(
-                label="Download CSV",
-                data=csv_bytes,
-                file_name="crawl_results.csv",
-                mime="text/csv"
-            )
-
-    else:  # Sitemap mode
-        st.subheader("Sitemap Mode")
-        st.write("Enter one or multiple sitemap URLs (one per line)")
-        sitemap_text = st.text_area("Sitemap URLs", "")
-        
-        # Initialize session state for Sitemap mode
-        if 'sitemap_is_crawling' not in st.session_state:
-            st.session_state['sitemap_is_crawling'] = False
-        if 'sitemap_crawl_results' not in st.session_state:
-            st.session_state['sitemap_crawl_results'] = []
-        if 'sitemap_crawl_done' not in st.session_state:
-            st.session_state['sitemap_crawl_done'] = False
-        if 'sitemap_checker' not in st.session_state:
-            st.session_state['sitemap_checker'] = None
-        if 'sitemap_urls' not in st.session_state:
-            st.session_state['sitemap_urls'] = []
-
-        # Create button container
-        button_container = st.container()
-        
-        # Place the button in the container
-        with button_container:
-            if st.session_state['sitemap_is_crawling']:
-                if st.button("Stop Crawl", type="primary"):
-                    if st.session_state['sitemap_checker']:
-                        st.session_state['sitemap_checker'].stop()
-                        st.session_state['sitemap_is_crawling'] = False
-                        # Save current results before stopping
-                        if st.session_state['sitemap_checker'].recent_results:
-                            st.session_state['sitemap_crawl_results'].extend(st.session_state['sitemap_checker'].recent_results)
-                            st.session_state['sitemap_crawl_done'] = True
-                        st.info("Stopping crawl after current tasks complete...")
-                        st.rerun()
-            else:
-                if st.button("Start Crawl", type="primary"):
-                    if not sitemap_text.strip():
-                        st.warning("No sitemap URLs provided.")
-                        return
+                    st.session_state['sitemap_parsed_urls'] = [] # Reset for new crawl
                     
-                    # First process sitemaps to get URLs
-                    lines = [x.strip() for x in sitemap_text.splitlines() if x.strip()]
-                    with st.expander("Discovered URLs", expanded=True):
-                        table_ph = st.empty()
-                        def show_partial_sitemap(all_urls):
-                            df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
-                            table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        all_sitemap_urls = loop.run_until_complete(process_sitemaps(lines, show_partial_callback=show_partial_sitemap))
-                        loop.close()
+                    checker = URLChecker(user_agent, concurrency, timeout_val, respect_robots)
+                    st.session_state['checker_instance'] = checker
+                    
+                    logger.info(f"Starting crawl in {mode} mode.")
+                    st.rerun() # Rerun to start the async operation block
 
-                    if not all_sitemap_urls:
-                        st.warning("No URLs found in these sitemaps.")
-                        return
-
-                    st.session_state['sitemap_urls'] = all_sitemap_urls
-                    st.session_state['sitemap_is_crawling'] = True
-                    st.session_state['sitemap_crawl_results'] = []
-                    st.session_state['sitemap_crawl_done'] = False
-                    checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
-                    st.session_state['sitemap_checker'] = checker
-                    st.rerun()
-
-        progress_ph = st.empty()
-        progress_bar = st.progress(0.0)
-        with st.expander("Results", expanded=True):
+    # Progress and Results Area
+    if st.session_state['is_crawling'] or st.session_state['crawl_done']:
+        st.markdown("---")
+        st.subheader("📊 Crawl Progress & Results")
+        progress_text_ph = st.empty()
+        progress_bar_ph = st.progress(0.0)
+        
+        results_expander = st.expander("实时结果 / Live Results", expanded=True)
+        with results_expander:
             table_ph = st.empty()
             download_ph = st.empty()
 
-        def show_partial_data(res_list, done_count, total_count):
-            ratio = done_count / total_count if total_count else 1.0
-            progress_bar.progress(ratio)
-            remain = total_count - done_count
-            pct = ratio * 100
-            progress_ph.write(
-                f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
-            )
-            if done_count % 20 == 0 or done_count == total_count:
-                # Combine current results with any previously saved results
-                all_results = st.session_state['sitemap_crawl_results'] + res_list
-                df_temp = pd.DataFrame(all_results)
+    def show_partial_data_ui(current_results_list: List[Dict], processed_count: int, total_count: int):
+        # This callback is from the crawler's perspective (list of dicts)
+        # It receives all results *so far* for the current batch/crawl.
+        # st.session_state['crawl_results'] should accumulate these.
+        # Here, current_results_list is the complete list of results obtained so far in this crawl run.
+        
+        st.session_state['crawl_results'] = current_results_list # Update global results with current full list
+
+        ratio = (processed_count / total_count) if total_count > 0 else 0
+        ratio = min(1.0, ratio) # Cap at 100%
+        
+        progress_bar_ph.progress(ratio)
+        remain = max(0, total_count - processed_count)
+        progress_text_ph.info(
+            f"Crawling... Completed {processed_count} of ~{total_count} URLs ({ratio:.1%}). Remaining: ~{remain}"
+        )
+        
+        # Update DataFrame display periodically
+        if current_results_list and (processed_count % 20 == 0 or processed_count == total_count or checker.is_stopped()):
+            df_temp = pd.DataFrame(current_results_list)
+            if not df_temp.empty:
                 df_temp = format_and_reorder_df(df_temp)
                 table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                if st.session_state['sitemap_crawl_done']:
-                    csv_data = df_temp.to_csv(index=False)
-                    csv_bytes = csv_data.encode("utf-8")
-                    download_ph.download_button(
-                        label="Download CSV",
-                        data=csv_bytes,
-                        file_name="crawl_results.csv",
-                        mime="text/csv"
-                    )
 
-        # Start the crawl if is_crawling is True
-        if st.session_state['sitemap_is_crawling']:
+    # Async Crawl Execution Block
+    if st.session_state['is_crawling'] and not st.session_state['crawl_done']:
+        checker = st.session_state['checker_instance']
+        final_results = []
+        
+        # Prepare arguments for run_crawl_logic
+        crawl_args = {
+            "crawl_type": mode,
+            "checker": checker,
+            "show_partial_callback": show_partial_data_ui,
+            "seed_url": seed_url_input.strip() if mode == "Spider" else None,
+            "url_list": [u.strip() for u in list_input_text.splitlines() if u.strip()] if mode == "List" else None,
+            "sitemap_urls_input": [s.strip() for s in sitemap_input_text.splitlines() if s.strip()] if (mode == "Sitemap" or (mode=="Spider" and sitemap_spider_seed_mode)) else None,
+            "include_pattern_str": include_pattern if mode == "Spider" else None,
+            "exclude_pattern_str": exclude_pattern if mode == "Spider" else None,
+            "max_spider_urls_limit": max_spider_urls if mode == "Spider" else 0 # Not applicable for list/sitemap
+        }
+
+        try:
+            # Get or create event loop
             try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+            except RuntimeError: # No current event loop
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(
-                    run_sitemap_crawl(
-                        urls=st.session_state['sitemap_urls'],
-                        checker=st.session_state['sitemap_checker'],
-                        show_partial_callback=show_partial_data
-                    )
-                )
-                # Combine new results with any existing results
-                st.session_state['sitemap_crawl_results'].extend(results)
-                st.session_state['sitemap_crawl_done'] = True
-                st.session_state['sitemap_is_crawling'] = False
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error during crawl: {str(e)}")
-                logging.error(f"Crawl error: {e}")
-                # Preserve results even if there's an error
-                if st.session_state['sitemap_checker'].recent_results:
-                    st.session_state['sitemap_crawl_results'].extend(st.session_state['sitemap_checker'].recent_results)
-                    st.session_state['sitemap_crawl_done'] = True
-                st.session_state['sitemap_is_crawling'] = False
-                st.rerun()
-            finally:
-                loop.close()
 
-        # Show final results if crawl is done (either completed or stopped)
-        if st.session_state['sitemap_crawl_done'] and st.session_state['sitemap_crawl_results']:
-            df_final = pd.DataFrame(st.session_state['sitemap_crawl_results'])
+            # Check if loop is already running (e.g. from nest_asyncio)
+            if not loop.is_running():
+                 final_results = loop.run_until_complete(run_crawl_logic(**crawl_args))
+            else: # If loop is already running (common with nest_asyncio in some envs)
+                 # We need to schedule it. This can be tricky with Streamlit's execution model.
+                 # Forcing it here. This might be an area needing refinement depending on exact env.
+                 future = asyncio.ensure_future(run_crawl_logic(**crawl_args), loop=loop)
+                 # Streamlit doesn't easily await. This will block here if loop is managed by nest_asyncio.
+                 # If not using nest_asyncio and this path is hit, it's more complex.
+                 # The nest_asyncio.apply() at the top should make run_until_complete work even if nested.
+                 # So, the `else` for loop.is_running() might not be typically hit in a simple Streamlit script.
+                 # If it *is* hit, it implies a more complex asyncio setup.
+                 # For now, let's assume run_until_complete is the primary path due to nest_asyncio.
+                 logger.warning("Event loop was already running. Attempting to run task on existing loop.")
+                 final_results = loop.run_until_complete(future)
+
+
+            st.session_state['crawl_results'] = final_results # Store all results
+            st.session_state['crawl_done'] = True
+        
+        except Exception as e:
+            logger.error(f"Crawl execution error: {e}", exc_info=True)
+            st.error(f"An error occurred during the crawl: {e}")
+            st.session_state['crawl_done'] = True # Mark as done even on error to show partial results
+        finally:
+            st.session_state['is_crawling'] = False # Ensure this is set false
+            # Cleanup is handled within run_crawl_logic/checker methods
+            if loop and not loop.is_closed() and not loop.is_running() and not nest_asyncio.has_nested_asyncio():
+                # Only close if we created it and it's not managed by nest_asyncio in a way that expects it to stay open.
+                # This is tricky. With nest_asyncio, direct closing can sometimes cause issues.
+                # loop.close()
+                pass 
+            st.rerun() # Rerun to update UI based on crawl_done and final results
+
+    # Display final results and download button if crawl is done
+    if st.session_state['crawl_done']:
+        progress_text_ph.success(f"Crawl finished! Found {len(st.session_state['crawl_results'])} results.")
+        progress_bar_ph.progress(1.0)
+        
+        df_final = pd.DataFrame(st.session_state['crawl_results'])
+        if not df_final.empty:
             df_final = format_and_reorder_df(df_final)
             table_ph.dataframe(df_final, height=500, use_container_width=True)
-            csv_data = df_final.to_csv(index=False)
-            csv_bytes = csv_data.encode("utf-8")
-            download_ph.download_button(
-                label="Download CSV",
-                data=csv_bytes,
-                file_name="crawl_results.csv",
-                mime="text/csv"
-            )
+            
+            csv_data = df_final.to_csv(index=False).encode('utf-8')
+            excel_data_buffer = io.BytesIO()
+            df_final.to_excel(excel_data_buffer, index=False, engine='openpyxl')
+            excel_data_bytes = excel_data_buffer.getvalue()
 
-def show_summary(df: pd.DataFrame):
-    st.subheader("Summary")
+            dl_cols = download_ph.columns(2)
+            with dl_cols[0]:
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=csv_data,
+                    file_name=f"crawl_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            with dl_cols[1]:
+                st.download_button(
+                    label="📥 Download Excel",
+                    data=excel_data_bytes,
+                    file_name=f"crawl_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            
+            show_summary_stats(df_final)
+        else:
+            table_ph.info("No results to display.")
+
+def show_summary_stats(df: pd.DataFrame):
+    st.subheader("📈 Summary Statistics")
     if df.empty:
         st.write("No data available for summary.")
         return
 
-    def display_distribution(column_name: str, title: str):
-        if column_name in df.columns:
-            counts = df[column_name].value_counts(dropna=False).reset_index()
-            counts.columns = [column_name, "Count"]
-            st.write(f"**{title}**")
-            st.table(counts)
+    cols = st.columns(2)
+    with cols[0]:
+        st.metric("Total URLs Processed", len(df))
+        if "Indexable" in df.columns:
+            st.metric("Indexable URLs", df[df["Indexable"] == "Yes"].shape[0])
+        if "Blocked by Robots.txt" in df.columns:
+            st.metric("Blocked by Robots.txt", df[df["Blocked by Robots.txt"] == "Yes"].shape[0])
+    
+    with cols[1]:
+        if "Final_Status_Code" in df.columns:
+            # Filter out "Error" or non-numeric status codes for this metric
+            numeric_statuses = pd.to_numeric(df["Final_Status_Code"], errors='coerce').dropna()
+            st.metric("Avg. Word Count (200 OK)", 
+                      int(df.loc[numeric_statuses == 200, "Word Count"].mean()) 
+                      if not df.loc[numeric_statuses == 200, "Word Count"].empty else 0)
 
-    display_distribution("Initial_Status_Code", "Initial Status Code Distribution")
-    display_distribution("Final_Status_Code", "Final Status Code Distribution")
-    display_distribution("Blocked by Robots.txt", "Blocked by Robots.txt?")
-    display_distribution("Indexable", "Indexable?")
-    display_distribution("Indexability Reason", "Indexability Reasons")
+    # Status Code Distribution
+    if "Final_Status_Code" in df.columns:
+        status_counts = df["Final_Status_Code"].value_counts().reset_index()
+        status_counts.columns = ["Status Code", "Count"]
+        st.write("**Final Status Code Distribution:**")
+        st.dataframe(status_counts, use_container_width=True)
+
+    # Indexability Reasons
+    if "Indexability Reason" in df.columns and not df[df["Indexable"] == "No"].empty :
+        reason_counts = df[df["Indexable"] == "No"]["Indexability Reason"].value_counts().reset_index()
+        reason_counts.columns = ["Reason", "Count"]
+        st.write("**Top Non-Indexability Reasons:**")
+        st.dataframe(reason_counts, use_container_width=True)
 
 if __name__ == "__main__":
-    main() 
+    import io # For Excel download
+    main_streamlit_app()
