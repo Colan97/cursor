@@ -440,16 +440,19 @@ class URLChecker:
             }
 
             try:
-                # Check robots.txt before making the request
-                if self.respect_robots:
-                    allowed, blocking_rule = await self.check_robots(url)
-                    data["Blocked by Robots.txt"] = "No" if allowed else "Yes"
-                    data["Robots Block Rule"] = blocking_rule if not allowed else ""
-                    if not allowed:
+                # Always check robots.txt, but only respect it if respect_robots is True
+                allowed, blocking_rule = await self.check_robots(url)
+                data["Blocked by Robots.txt"] = "No" if allowed else "Yes"
+                data["Robots Block Rule"] = blocking_rule if not allowed else ""
+                
+                if not allowed:
+                    if self.respect_robots:
                         data["Indexable"] = "No"
                         data["Indexability Reason"] = f"Blocked by robots.txt: {blocking_rule}"
                         logging.info(f"URL {url} blocked by robots.txt. Rule: {blocking_rule}")
                         return data
+                    else:
+                        logging.info(f"URL {url} is blocked by robots.txt but crawling anyway (respect_robots is False)")
 
                 # Make the request with retry logic
                 for attempt in range(3):
@@ -590,36 +593,35 @@ class URLChecker:
             html_tag = soup.find("html")
             data["HTML Lang"] = html_tag.get("lang", "") if html_tag else ""
             
-            # Determine indexability
+            # Determine indexability - Follow priority order
             data["Indexable"] = "Yes"
             data["Indexability Reason"] = ""
             
-            # Check for noindex in meta robots (case-insensitive)
+            # Priority 1: Check robots.txt block (if respect_robots is True)
+            if data["Blocked by Robots.txt"] == "Yes":
+                data["Indexable"] = "No"
+                data["Indexability Reason"] = f"Blocked by robots.txt: {data['Robots Block Rule']}"
+                return data  # Return early if blocked by robots.txt
+            
+            # Priority 2: Check for noindex in meta robots or X-Robots-Tag
             meta_robots_lower = data["Meta Robots"].lower()
             x_robots_lower = data["X-Robots-Tag"].lower()
-            
-            # Check for noindex directives
             if "noindex" in meta_robots_lower or "noindex" in x_robots_lower:
                 data["Indexable"] = "No"
                 data["Indexability Reason"] = "Noindex directive"
+                return data  # Return early if noindex is found
             
-            # Check for nofollow directives
-            if "nofollow" in meta_robots_lower or "nofollow" in x_robots_lower:
-                if data["Indexability Reason"]:
-                    data["Indexability Reason"] += " and Nofollow directive"
-                else:
-                    data["Indexable"] = "No"
-                    data["Indexability Reason"] = "Nofollow directive"
-            
-            # Check for canonical URL mismatch
+            # Priority 3: Check for canonical URL mismatch
             if data["Canonical_URL"] and data["Canonical_URL"] != data["Final_URL"]:
                 data["Indexable"] = "No"
                 data["Indexability Reason"] = "Canonical URL mismatch"
+                return data  # Return early if canonical mismatch is found
             
-            # Check for empty content
+            # Priority 4: Check for empty content
             if not data["Title"] and not data["H1"] and not data["Meta Description"]:
                 data["Indexable"] = "No"
                 data["Indexability Reason"] = "Empty content (no title, H1, or meta description)"
+                return data  # Return early if content is empty
             
             # Calculate word count
             text = soup.get_text()
