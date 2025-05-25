@@ -410,6 +410,11 @@ class URLChecker:
                             data["Final_Status_Type"] = self.status_label(resp.status)
                             data["Last Modified"] = resp.headers.get("Last-Modified", "")
 
+                            # Mark non-200 pages as non-indexable
+                            if resp.status != 200:
+                                data["Indexable"] = "No"
+                                data["Indexability Reason"] = f"HTTP Status {resp.status}"
+
                             if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
                                 content = await resp.text(errors='replace')
                                 result = self.parse_html_content(data, content, resp.headers, resp.status, True)
@@ -538,10 +543,32 @@ class URLChecker:
             data["Indexable"] = "Yes"
             data["Indexability Reason"] = ""
             
-            # Check for noindex
-            if "noindex" in data["Meta Robots"].lower() or "noindex" in data["X-Robots-Tag"].lower():
+            # Check for noindex in meta robots (case-insensitive)
+            meta_robots_lower = data["Meta Robots"].lower()
+            x_robots_lower = data["X-Robots-Tag"].lower()
+            
+            # Check for noindex directives
+            if "noindex" in meta_robots_lower or "noindex" in x_robots_lower:
                 data["Indexable"] = "No"
                 data["Indexability Reason"] = "Noindex directive"
+            
+            # Check for nofollow directives
+            if "nofollow" in meta_robots_lower or "nofollow" in x_robots_lower:
+                if data["Indexability Reason"]:
+                    data["Indexability Reason"] += " and Nofollow directive"
+                else:
+                    data["Indexable"] = "No"
+                    data["Indexability Reason"] = "Nofollow directive"
+            
+            # Check for canonical URL mismatch
+            if data["Canonical_URL"] and data["Canonical_URL"] != data["Final_URL"]:
+                data["Indexable"] = "No"
+                data["Indexability Reason"] = "Canonical URL mismatch"
+            
+            # Check for empty content
+            if not data["Title"] and not data["H1"] and not data["Meta Description"]:
+                data["Indexable"] = "No"
+                data["Indexability Reason"] = "Empty content (no title, H1, or meta description)"
             
             # Calculate word count
             text = soup.get_text()
